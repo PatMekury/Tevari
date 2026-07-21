@@ -260,6 +260,7 @@ private struct GlassesReadinessView: View {
     @ObservedObject var wearables: WearablesService
     let continueOnPhone: () -> Void
     let changeChoice: () -> Void
+    @State private var showsFaithLens = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -308,6 +309,15 @@ private struct GlassesReadinessView: View {
                     .padding(.top, 12)
             }
             if let error = wearables.errorMessage { Text(error).font(.footnote).foregroundStyle(.red) }
+            if wearables.isExperienceActive {
+                Button {
+                    showsFaithLens = true
+                } label: {
+                    Label("Open Faith Lens", systemImage: "camera.viewfinder")
+                }
+                .buttonStyle(TevariGlassButtonStyle())
+                .padding(.top, 12)
+            }
             if wearables.requiresGlassesAppUpdate {
                 Button("Update app on glasses") {
                     wearables.openGlassesAppUpdate()
@@ -325,6 +335,11 @@ private struct GlassesReadinessView: View {
         .padding(.horizontal, 24)
         .padding(.top, 62)
         .padding(.bottom, 34)
+        .fullScreenCover(isPresented: $showsFaithLens) {
+            FaithLensControlView(wearables: wearables) {
+                showsFaithLens = false
+            }
+        }
     }
 
     private var primaryButtonTitle: String {
@@ -347,6 +362,187 @@ private struct GlassesReadinessView: View {
             Spacer()
         }
         .padding(.vertical, 12)
+    }
+}
+
+/// The phone is the private control surface for Faith Lens: it shows the
+/// locally streamed preview, live question, and the explicit capture action.
+/// The glasses stay uncluttered and show only the final reflection and verse.
+private struct FaithLensControlView: View {
+    @ObservedObject var wearables: WearablesService
+    let onDone: () -> Void
+    @State private var typedQuestion = ""
+
+    private var question: String {
+        let typed = typedQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        return typed.isEmpty ? wearables.faithLensQuestion : typed
+    }
+
+    var body: some View {
+        AuthenticationCanvas {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    BackButton(action: endFaithLens)
+                    Spacer()
+                    Text("FAITH LENS")
+                        .font(.system(size: 12, weight: .medium, design: .default))
+                        .tracking(2)
+                        .foregroundStyle(Color.tevariGold)
+                }
+
+                Text("See this moment through faith")
+                    .font(.system(size: 28, weight: .medium, design: .default))
+                    .foregroundStyle(.white)
+                    .padding(.top, 26)
+                Text("Point your glasses, ask what is on your heart, then capture one moment for Tevari to reflect on.")
+                    .font(.system(size: 14, design: .default))
+                    .foregroundStyle(.white.opacity(0.66))
+                    .padding(.top, 7)
+
+                preview
+                    .padding(.top, 22)
+
+                Text(wearables.faithLensStatus)
+                    .font(.system(size: 13, weight: .medium, design: .default))
+                    .foregroundStyle(wearables.faithLensStatus.contains("Could not") ? .red : Color.tevariSage)
+                    .padding(.top, 10)
+
+                if wearables.latestFaithLensFrame == nil {
+                    Button("Start camera") { wearables.startFaithLensCamera() }
+                        .buttonStyle(TevariPrimaryButtonStyle())
+                        .padding(.top, 16)
+                } else {
+                    questionControls
+                        .padding(.top, 18)
+                }
+
+                if let response = wearables.faithLensResponse {
+                    responseCard(response)
+                        .padding(.top, 22)
+                }
+
+                if let error = wearables.errorMessage {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                        .padding(.top, 14)
+                }
+
+                Text("Your preview remains on this phone. Tevari sends only the frame you capture and the question you choose. Nothing is saved unless you choose Save.")
+                    .font(.system(size: 12, design: .default))
+                    .foregroundStyle(.white.opacity(0.48))
+                    .padding(.top, 22)
+            }
+        }
+        .preferredColorScheme(.dark)
+        .onAppear { wearables.openFaithLens() }
+    }
+
+    private var preview: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.black.opacity(0.35))
+            if let image = wearables.latestFaithLensFrame {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "camera.viewfinder")
+                        .font(.system(size: 30, weight: .light))
+                        .foregroundStyle(Color.tevariGold)
+                    Text("Camera is off")
+                        .font(.system(size: 14, weight: .medium, design: .default))
+                        .foregroundStyle(.white.opacity(0.72))
+                }
+            }
+        }
+        .frame(height: 238)
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .tevariGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+
+    private var questionControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Your question")
+                .font(.system(size: 16, weight: .medium, design: .default))
+                .foregroundStyle(.white)
+            Text(wearables.faithLensQuestion.isEmpty ? "Tap Ask by voice, then speak naturally." : wearables.faithLensQuestion)
+                .font(.system(size: 15, design: .default))
+                .foregroundStyle(.white.opacity(wearables.faithLensQuestion.isEmpty ? 0.48 : 0.85))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            TextField("Or type your question", text: $typedQuestion, axis: .vertical)
+                .lineLimit(2...4)
+                .padding(14)
+                .tevariGlass(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .foregroundStyle(.white)
+            HStack(spacing: 10) {
+                Button(wearables.faithLensStatus == "Listening for your question" ? "Stop listening" : "Ask by voice") {
+                    if wearables.faithLensStatus == "Listening for your question" {
+                        wearables.stopFaithLensListening()
+                    } else {
+                        typedQuestion = ""
+                        wearables.startFaithLensListening()
+                    }
+                }
+                .buttonStyle(TevariGlassButtonStyle())
+
+                Button("Capture") {
+                    wearables.stopFaithLensListening()
+                    wearables.captureFaithLens(question: question)
+                }
+                .buttonStyle(TevariPrimaryButtonStyle())
+                .disabled(question.isEmpty || wearables.faithLensStatus == "Capturing this moment" || wearables.faithLensStatus == "Reflecting on this moment")
+                .opacity(question.isEmpty ? 0.5 : 1)
+            }
+        }
+    }
+
+    private func responseCard(_ response: TevariFaithLensResponse) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Reflection")
+                .font(.system(size: 16, weight: .medium, design: .default))
+                .foregroundStyle(Color.tevariGold)
+            Text(response.response)
+                .font(.system(size: 15, design: .default))
+                .foregroundStyle(.white)
+            Text("Scripture")
+                .font(.system(size: 16, weight: .medium, design: .default))
+                .foregroundStyle(Color.tevariGold)
+                .padding(.top, 4)
+            Text(response.scripture.reference)
+                .font(.system(size: 14, weight: .semibold, design: .default))
+                .foregroundStyle(.white)
+            Text(response.scripture.content)
+                .font(.system(size: 14, design: .serif))
+                .foregroundStyle(.white.opacity(0.88))
+            Text("Bible text via YouVersion • \(response.scripture.bible.title) (\(response.scripture.bible.abbreviation))")
+                .font(.system(size: 11, design: .default))
+                .foregroundStyle(.white.opacity(0.48))
+            if let prayer = response.prayer {
+                Text("Prayer")
+                    .font(.system(size: 16, weight: .medium, design: .default))
+                    .foregroundStyle(Color.tevariGold)
+                    .padding(.top, 4)
+                Text(prayer)
+                    .font(.system(size: 14, design: .default))
+                    .foregroundStyle(.white.opacity(0.88))
+            }
+            Button("Hear response") { wearables.speakFaithLensResponse() }
+                .buttonStyle(TevariGlassButtonStyle())
+                .padding(.top, 4)
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .tevariGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    private func endFaithLens() {
+        wearables.stopFaithLensCamera()
+        wearables.returnToGlassesHome()
+        onDone()
     }
 }
 

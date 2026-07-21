@@ -59,6 +59,15 @@ struct TevariPrayerPrompt: Decodable, Sendable {
     let model: String?
 }
 
+/// A Faith Lens response always keeps generated reflection separate from the
+/// licensed Scripture supplied by YouVersion.
+struct TevariFaithLensResponse: Decodable, Sendable {
+    let response: String
+    let prayer: String?
+    let scripture: TevariPrayerPrompt.Scripture
+    let model: String?
+}
+
 struct TevariScripturePassage: Decodable, Sendable {
     struct Passage: Decodable, Sendable {
         let id: String
@@ -101,6 +110,21 @@ enum TevariAPI {
         try await request(
             path: "scripturePassage",
             body: ["bibleID": bibleID, "passageID": passageID]
+        )
+    }
+
+    static func faithLens(
+        imageData: Data,
+        question: String,
+        tradition: String = "general"
+    ) async throws -> TevariFaithLensResponse {
+        try await request(
+            path: "faithLens",
+            body: [
+                "imageBase64": imageData.base64EncodedString(),
+                "question": question,
+                "tradition": tradition
+            ]
         )
     }
 

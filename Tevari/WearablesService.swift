@@ -3,7 +3,9 @@ import Foundation
 import AVFoundation
 import Speech
 import MWDATCore
+import MWDATCamera
 import MWDATDisplay
+import UIKit
 
 /// Owns the live DAT connection for Tevari's internal Developer Mode testing.
 /// The iPhone remains authoritative; glasses receive a small display card only
@@ -21,6 +23,10 @@ final class WearablesService: ObservableObject {
     @Published private(set) var requiresGlassesAppUpdate = false
     @Published private(set) var glassesRouteTitle = "Home"
     @Published private(set) var prayerStatus = "Not started"
+    @Published private(set) var faithLensStatus = "Not started"
+    @Published private(set) var latestFaithLensFrame: UIImage?
+    @Published private(set) var faithLensResponse: TevariFaithLensResponse?
+    @Published private(set) var faithLensQuestion = ""
     @Published var errorMessage: String?
 
     private var registrationTask: Task<Void, Never>?
@@ -30,6 +36,13 @@ final class WearablesService: ObservableObject {
     private var displayStateToken: AnyListenerToken?
     private var deviceSession: DeviceSession?
     private var display: Display?
+    private var cameraStream: MWDATCamera.Stream?
+    private var cameraStateToken: AnyListenerToken?
+    private var cameraFrameToken: AnyListenerToken?
+    private var cameraPhotoToken: AnyListenerToken?
+    private var cameraErrorToken: AnyListenerToken?
+    private var pendingFaithLensQuestion: String?
+    private let faithLensSpeechSynthesizer = AVSpeechSynthesizer()
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     // Recreated after an audio-route change so the engine does not retain the
     // iPhone microphone's format when a glasses HFP microphone is selected.
@@ -132,6 +145,7 @@ final class WearablesService: ObservableObject {
 
     func stopGlassesExperience() {
         stopPrayerListening()
+        stopFaithLensCamera()
         display?.stop()
         deviceSession?.stop()
         isExperienceActive = false
@@ -149,8 +163,189 @@ final class WearablesService: ObservableObject {
 
     func returnToGlassesHome() {
         stopPrayerListening()
+        stopFaithLensCamera()
         glassesRouteTitle = "Home"
         Task { await sendGlassesHomeCard() }
+    }
+
+    /// Faith Lens makes the camera state explicit: starting this method only
+    /// starts a local glasses preview. Analysis happens later, after a user
+    /// asks a question and chooses to capture one frame.
+    func openFaithLens() {
+        stopPrayerListening()
+        glassesRouteTitle = "Faith Lens"
+        faithLensStatus = "Ready to start camera"
+        faithLensResponse = nil
+        Task { await sendFaithLensEntryCard() }
+    }
+
+    func startFaithLensCamera() {
+        guard let deviceSession, cameraStream == nil else { return }
+        errorMessage = nil
+        faithLensStatus = "Starting camera"
+        do {
+            guard let stream = try deviceSession.addStream(config: StreamConfiguration(videoCodec: .raw, resolution: .medium, frameRate: 15)) else {
+                throw NSError(domain: "Tevari", code: 7, userInfo: [NSLocalizedDescriptionKey: "The glasses did not create a camera stream."])
+            }
+            cameraStream = stream
+            cameraStateToken = stream.statePublisher.listen { [weak self] state in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.faithLensStatus = state == .streaming ? "Camera live — ask a question" : String(describing: state).capitalized
+                }
+            }
+            cameraFrameToken = stream.videoFramePublisher.listen { [weak self] frame in
+                let image = frame.makeUIImage()
+                Task { @MainActor [weak self] in self?.latestFaithLensFrame = image }
+            }
+            cameraPhotoToken = stream.photoDataPublisher.listen { [weak self] photo in
+                Task { @MainActor [weak self] in await self?.receivedFaithLensCapture(photo.data) }
+            }
+            cameraErrorToken = stream.errorPublisher.listen { [weak self] error in
+                Task { @MainActor [weak self] in
+                    self?.faithLensStatus = "Camera unavailable"
+                    self?.errorMessage = "Faith Lens camera: \(error.localizedDescription)"
+                }
+            }
+            stream.start()
+        } catch {
+            faithLensStatus = "Camera could not start"
+            errorMessage = "Faith Lens could not access the glasses camera: \(error.localizedDescription)"
+        }
+    }
+
+    func captureFaithLens(question: String) {
+        let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let cameraStream else { return }
+        pendingFaithLensQuestion = trimmed
+        faithLensStatus = "Capturing this moment"
+        guard cameraStream.capturePhoto(format: .jpeg) else {
+            faithLensStatus = "Could not capture"
+            errorMessage = "Faith Lens could not capture a frame. Keep the glasses open and try again."
+            return
+        }
+    }
+
+    /// Speaks the short, generated reflection only after the user asks to hear it.
+    /// The Scripture remains visibly attributed to its licensed Bible source.
+    func speakFaithLensResponse() {
+        guard let result = faithLensResponse else { return }
+        stopFaithLensListening()
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.allowBluetoothA2DP])
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        } catch {
+            errorMessage = "Faith Lens could not prepare audio: \(error.localizedDescription)"
+            return
+        }
+        faithLensSpeechSynthesizer.stopSpeaking(at: .immediate)
+        let spokenPrayer = result.prayer.map { " Prayer: \($0)" } ?? ""
+        let utterance = AVSpeechUtterance(string: "\(result.response) \(result.scripture.reference). \(result.scripture.content)\(spokenPrayer)")
+        utterance.rate = 0.46
+        faithLensSpeechSynthesizer.speak(utterance)
+    }
+
+    /// Starts a separate, explicit spoken question. It does not keep audio or
+    /// the transcript after the user captures a frame or cancels the flow.
+    func startFaithLensListening() {
+        guard !audioEngine.isRunning else { return }
+        Task {
+            errorMessage = nil
+            faithLensQuestion = ""
+            guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
+                faithLensStatus = "Microphone permission needed"
+                errorMessage = "Allow Microphone and Speech Recognition for Tevari in iPhone Settings, then try Faith Lens again."
+                return
+            }
+            do {
+                try await beginFaithLensSpeechRecognition()
+                faithLensStatus = "Listening for your question"
+            } catch {
+                faithLensStatus = "Could not listen"
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func stopFaithLensListening() {
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setPreferredInput(nil)
+        try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+        if faithLensStatus == "Listening for your question" { faithLensStatus = "Question ready" }
+    }
+
+    func stopFaithLensCamera() {
+        stopFaithLensListening()
+        cameraStream?.stop()
+        cameraStateToken = nil
+        cameraFrameToken = nil
+        cameraPhotoToken = nil
+        cameraErrorToken = nil
+        cameraStream = nil
+        pendingFaithLensQuestion = nil
+        latestFaithLensFrame = nil
+        if faithLensStatus != "Not started" { faithLensStatus = "Stopped" }
+    }
+
+    private func receivedFaithLensCapture(_ data: Data) async {
+        guard let question = pendingFaithLensQuestion else { return }
+        pendingFaithLensQuestion = nil
+        faithLensStatus = "Reflecting on this moment"
+        do {
+            let response = try await TevariAPI.faithLens(imageData: data, question: question)
+            faithLensResponse = response
+            faithLensStatus = "Reflection ready"
+            await sendFaithLensResponseCard(response)
+        } catch {
+            faithLensStatus = "Could not reflect"
+            errorMessage = error.localizedDescription
+            await sendFaithLensEntryCard()
+        }
+    }
+
+    private func beginFaithLensSpeechRecognition() async throws {
+        guard let speechRecognizer, speechRecognizer.isAvailable else {
+            throw NSError(domain: "Tevari", code: 4, userInfo: [NSLocalizedDescriptionKey: "Speech Recognition is unavailable right now."])
+        }
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
+        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        guard let hfpInput = audioSession.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) else {
+            throw NSError(domain: "Tevari", code: 5, userInfo: [NSLocalizedDescriptionKey: "Glasses microphone is unavailable. Reconnect your glasses in Meta AI and try again."])
+        }
+        try audioSession.setPreferredInput(hfpInput)
+        try await Task.sleep(for: .seconds(2))
+        guard audioSession.currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) else {
+            throw NSError(domain: "Tevari", code: 6, userInfo: [NSLocalizedDescriptionKey: "Tevari could not route audio to your glasses microphone."])
+        }
+        audioEngine = AVAudioEngine()
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        recognitionRequest = request
+        let input = audioEngine.inputNode
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1_024, format: input.inputFormat(forBus: 0)) { [weak self] buffer, _ in
+            self?.recognitionRequest?.append(buffer)
+        }
+        audioEngine.prepare()
+        try audioEngine.start()
+        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            Task { @MainActor in
+                guard let self else { return }
+                if let text = result?.bestTranscription.formattedString, !text.isEmpty { self.faithLensQuestion = text }
+                // Cancellation is expected when the user taps Capture or Stop.
+                if let error, self.audioEngine.isRunning {
+                    self.errorMessage = "Faith Lens stopped listening: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     /// Called only from the explicit Start prayer action on the glasses.
@@ -383,6 +578,9 @@ final class WearablesService: ObservableObject {
                     Button(label: "Pray", style: .primary, iconName: .checkmark, onClick: {
                         Task { @MainActor [service] in service.openPrayerExperience() }
                     })
+                    Button(label: "Faith Lens", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.openFaithLens() }
+                    })
                     Button(label: "Done", style: .primary, iconName: .checkmark, onClick: {
                         Task { @MainActor [service] in service.stopGlassesExperience() }
                     })
@@ -397,6 +595,45 @@ final class WearablesService: ObservableObject {
 
     private func sendPrayerEntryCard() async {
         queueDisplayCard(.prayerEntry)
+    }
+
+    private func sendFaithLensEntryCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Faith Lens", style: .heading)
+                    Text("Start the camera, then ask Tevari about what is before you. One frame is captured only when you ask.", style: .body, color: .secondary)
+                    Button(label: "Start camera", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.startFaithLensCamera() }
+                    })
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens: \(error.localizedDescription)" }
+    }
+
+    private func sendFaithLensResponseCard(_ result: TevariFaithLensResponse) async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Faith Lens", style: .heading)
+                    Text(result.response, style: .body)
+                    Text("Scripture", style: .heading)
+                    Text(result.scripture.reference, style: .body, color: .secondary)
+                    Text(result.scripture.content, style: .body)
+                    if let prayer = result.prayer { Text("Prayer: \(prayer)", style: .body, color: .secondary) }
+                    Button(label: "Done", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens response: \(error.localizedDescription)" }
     }
 
     private func sendPrayerEntryCardImmediately() async {
@@ -651,6 +888,7 @@ final class WearablesService: ObservableObject {
     }
 
     private func clearStoppedSession() {
+        stopFaithLensCamera()
         displayStateToken = nil
         display = nil
         deviceSession = nil

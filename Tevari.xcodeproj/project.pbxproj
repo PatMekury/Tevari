@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		DAT000000000000000000001 /* MWDATCore in Frameworks */ = {isa = PBXBuildFile; productRef = DAT000000000000000000101 /* MWDATCore */; };
 		DAT000000000000000000002 /* MWDATDisplay in Frameworks */ = {isa = PBXBuildFile; productRef = DAT000000000000000000102 /* MWDATDisplay */; };
+		DAT000000000000000000003 /* MWDATCamera in Frameworks */ = {isa = PBXBuildFile; productRef = DAT000000000000000000103 /* MWDATCamera */; };
 		FBA000000000000000000001 /* FirebaseAuth in Frameworks */ = {isa = PBXBuildFile; productRef = FBA000000000000000000101 /* FirebaseAuth */; };
 		FBA000000000000000000002 /* FirebaseCore in Frameworks */ = {isa = PBXBuildFile; productRef = FBA000000000000000000102 /* FirebaseCore */; };
 		GID000000000000000000001 /* GoogleSignIn in Frameworks */ = {isa = PBXBuildFile; productRef = GID000000000000000000101 /* GoogleSignIn */; };
@@ -49,6 +50,7 @@
 				FBA000000000000000000002 /* FirebaseCore in Frameworks */,
 				DAT000000000000000000001 /* MWDATCore in Frameworks */,
 				DAT000000000000000000002 /* MWDATDisplay in Frameworks */,
+				DAT000000000000000000003 /* MWDATCamera in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -96,6 +98,7 @@
 				FBA000000000000000000102 /* FirebaseCore */,
 				DAT000000000000000000101 /* MWDATCore */,
 				DAT000000000000000000102 /* MWDATDisplay */,
+				DAT000000000000000000103 /* MWDATCamera */,
 			);
 			productName = Tevari;
 			productReference = 54F0BBA3300BFBD500FA301F /* Tevari.app */;
@@ -408,6 +411,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = DAT000000000000000000201 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
 			productName = MWDATDisplay;
+		};
+		DAT000000000000000000103 /* MWDATCamera */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DAT000000000000000000201 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
+			productName = MWDATCamera;
 		};
 		FBA000000000000000000101 /* FirebaseAuth */ = {
 			isa = XCSwiftPackageProductDependency;
