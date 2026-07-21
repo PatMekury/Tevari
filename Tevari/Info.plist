@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com.googleusercontent.apps.697744335833-6m788cq5563lr93me4vfc7qms8tl72lc</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeRole</key><string>Editor</string>
+			<key>CFBundleURLName</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleURLSchemes</key><array><string>tevari</string></array>
+		</dict>
+	</array>
+	<key>LSApplicationQueriesSchemes</key><array><string>fb-viewapp</string></array>
+	<!-- Set only after Firebase deploys the TestFlight staging functions. This is not a credential. -->
+	<key>TevariAPIBaseURL</key>
+	<string>https://us-central1-tevari-502818.cloudfunctions.net</string>
+	<key>MWDAT</key>
+	<dict>
+		<key>AppLinkURLScheme</key>
+		<string>tevari://</string>
+		<!-- Developer Mode only. Replace with the Meta project credentials for release-channel builds. -->
+		<key>MetaAppID</key>
+		<string>0</string>
+		<key>TeamID</key>
+		<string>$(DEVELOPMENT_TEAM)</string>
+		<key>DAMEnabled</key>
+		<true/>
+	</dict>
+	<key>NSBluetoothAlwaysUsageDescription</key><string>Tevari uses Bluetooth to connect to your Meta glasses when you choose to connect them.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Tevari uses the microphone only after you start a spoken prayer, so it can transcribe the prayer you choose to share.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Tevari transcribes a spoken prayer only while you actively use the Start prayer control.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Tevari uses your local network only while you choose to connect to Meta glasses for live display experiences.</string>
+	<key>NSBonjourServices</key>
+	<array><string>_bonjour._tcp</string></array>
+	<key>UIBackgroundModes</key><array><string>bluetooth-central</string><string>bluetooth-peripheral</string><string>external-accessory</string><string>processing</string></array>
+	<key>UISupportedExternalAccessoryProtocols</key><array><string>com.meta.ar.wearable</string></array>
+	<key>UILaunchScreen</key>
+	<dict/>
+</dict>
+</plist>
