@@ -41,6 +41,8 @@ final class WearablesService: ObservableObject {
     private var cameraFrameToken: AnyListenerToken?
     private var cameraPhotoToken: AnyListenerToken?
     private var cameraErrorToken: AnyListenerToken?
+    private var isRequestingFaithLensCamera = false
+    private var hasPresentedFaithLensCameraControls = false
     private var pendingFaithLensQuestion: String?
     private let faithLensSpeechSynthesizer = AVSpeechSynthesizer()
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
@@ -180,10 +182,40 @@ final class WearablesService: ObservableObject {
     }
 
     func startFaithLensCamera() {
-        guard let deviceSession, cameraStream == nil else { return }
+        guard deviceSession != nil, cameraStream == nil, !isRequestingFaithLensCamera else { return }
+        isRequestingFaithLensCamera = true
+        hasPresentedFaithLensCameraControls = false
         errorMessage = nil
-        faithLensStatus = "Starting camera"
+        faithLensStatus = "Requesting camera access"
+        Task { [weak self] in
+            guard let self else { return }
+            await self.sendFaithLensCameraStartingCard()
+            await self.beginFaithLensCamera()
+        }
+    }
+
+    /// Meta glasses camera access is a separate permission from iOS's camera
+    /// privacy setting. The DAT SDK opens Meta AI when a grant is needed.
+    private func beginFaithLensCamera() async {
+        defer { isRequestingFaithLensCamera = false }
+
         do {
+            var permissionStatus = try await Wearables.shared.checkPermissionStatus(.camera)
+            if permissionStatus != .granted {
+                faithLensStatus = "Allow camera access in Meta AI"
+                await sendFaithLensPermissionCard()
+                permissionStatus = try await Wearables.shared.requestPermission(.camera)
+            }
+
+            guard permissionStatus == .granted else {
+                faithLensStatus = "Camera permission needed"
+                errorMessage = "Faith Lens needs Camera access in the Meta AI app. Choose Allow once or Allow always, then return to Tevari and start the camera again."
+                await sendFaithLensPermissionDeniedCard()
+                return
+            }
+
+            guard let deviceSession, cameraStream == nil else { return }
+            faithLensStatus = "Starting camera"
             guard let stream = try deviceSession.addStream(config: StreamConfiguration(videoCodec: .raw, resolution: .medium, frameRate: 15)) else {
                 throw NSError(domain: "Tevari", code: 7, userInfo: [NSLocalizedDescriptionKey: "The glasses did not create a camera stream."])
             }
@@ -192,6 +224,10 @@ final class WearablesService: ObservableObject {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.faithLensStatus = state == .streaming ? "Camera live — ask a question" : String(describing: state).capitalized
+                    if state == .streaming, !self.hasPresentedFaithLensCameraControls {
+                        self.hasPresentedFaithLensCameraControls = true
+                        await self.sendFaithLensCameraReadyCard()
+                    }
                 }
             }
             cameraFrameToken = stream.videoFramePublisher.listen { [weak self] frame in
@@ -205,12 +241,14 @@ final class WearablesService: ObservableObject {
                 Task { @MainActor [weak self] in
                     self?.faithLensStatus = "Camera unavailable"
                     self?.errorMessage = "Faith Lens camera: \(error.localizedDescription)"
+                    await self?.sendFaithLensCameraErrorCard()
                 }
             }
             stream.start()
         } catch {
             faithLensStatus = "Camera could not start"
-            errorMessage = "Faith Lens could not access the glasses camera: \(error.localizedDescription)"
+            errorMessage = "Faith Lens could not request glasses-camera access: \(error.localizedDescription)"
+            await sendFaithLensCameraErrorCard()
         }
     }
 
@@ -224,6 +262,7 @@ final class WearablesService: ObservableObject {
             errorMessage = "Faith Lens could not capture a frame. Keep the glasses open and try again."
             return
         }
+        Task { await sendFaithLensReflectingCard() }
     }
 
     /// Speaks the short, generated reflection only after the user asks to hear it.
@@ -268,6 +307,53 @@ final class WearablesService: ObservableObject {
         }
     }
 
+    /// Starts a spoken Faith Lens question from the glasses display. Audio is
+    /// routed to the glasses HFP microphone; iOS performs transcription only
+    /// for this active request and never stores it.
+    func startFaithLensListeningFromGlasses() {
+        guard !audioEngine.isRunning else { return }
+        Task {
+            errorMessage = nil
+            faithLensQuestion = ""
+            faithLensStatus = "Preparing glasses microphone"
+            await sendFaithLensListeningStartingCard()
+            guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
+                faithLensStatus = "Microphone permission needed"
+                errorMessage = "Allow Microphone and Speech Recognition for Tevari in iPhone Settings, then try your Faith Lens question again."
+                await sendFaithLensCameraReadyCard()
+                return
+            }
+            do {
+                try await beginFaithLensSpeechRecognition()
+                faithLensStatus = "Listening for your question"
+                await sendFaithLensListeningCard()
+            } catch {
+                faithLensStatus = "Could not listen"
+                errorMessage = "Tevari could not start the glasses microphone: \(error.localizedDescription)"
+                await sendFaithLensCameraReadyCard()
+            }
+        }
+    }
+
+    /// Ends transcription and lets the user confirm the words on the glasses
+    /// before Tevari captures or sends anything.
+    func finishFaithLensListeningFromGlasses() {
+        stopFaithLensListening()
+        let question = faithLensQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else {
+            faithLensStatus = "No question heard"
+            errorMessage = "Tevari did not hear a question. Keep the glasses microphone connected and try again."
+            Task { await sendFaithLensQuestionNotHeardCard() }
+            return
+        }
+        faithLensStatus = "Question ready"
+        Task { await sendFaithLensQuestionReviewCard(question) }
+    }
+
+    func sendFaithLensSpokenQuestion() {
+        captureFaithLens(question: faithLensQuestion)
+    }
+
     func stopFaithLensListening() {
         recognitionTask?.cancel()
         recognitionTask = nil
@@ -289,6 +375,7 @@ final class WearablesService: ObservableObject {
         cameraPhotoToken = nil
         cameraErrorToken = nil
         cameraStream = nil
+        hasPresentedFaithLensCameraControls = false
         pendingFaithLensQuestion = nil
         latestFaithLensFrame = nil
         if faithLensStatus != "Not started" { faithLensStatus = "Stopped" }
@@ -306,7 +393,7 @@ final class WearablesService: ObservableObject {
         } catch {
             faithLensStatus = "Could not reflect"
             errorMessage = error.localizedDescription
-            await sendFaithLensEntryCard()
+            await sendFaithLensCameraReadyCard()
         }
     }
 
@@ -614,6 +701,190 @@ final class WearablesService: ObservableObject {
                 }.padding(24).background(.card)
             )
         } catch { errorMessage = "Could not show Faith Lens: \(error.localizedDescription)" }
+    }
+
+    /// Faith Lens is operable entirely from the glasses. The phone can still
+    /// show a private live preview, but it is not required to capture a moment.
+    private func sendFaithLensPermissionCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Faith Lens", style: .heading)
+                    Text("Allow Camera access in Meta AI, then return here. Tevari uses your glasses camera only for the moment you choose to capture.", style: .body, color: .secondary)
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens permission status: \(error.localizedDescription)" }
+    }
+
+    private func sendFaithLensCameraStartingCard() async {
+        guard let display else { return }
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Faith Lens", style: .heading)
+                    Text("Starting your glasses camera…", style: .body, color: .secondary)
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens start status: \(error.localizedDescription)" }
+    }
+
+    private func sendFaithLensPermissionDeniedCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Camera permission needed", style: .heading)
+                    Text("In Meta AI, allow Tevari to use your glasses camera. Then come back and choose Start camera.", style: .body, color: .secondary)
+                    Button(label: "Try again", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.startFaithLensCamera() }
+                    })
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens permission result: \(error.localizedDescription)" }
+    }
+
+    private func sendFaithLensCameraReadyCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Faith Lens is live", style: .heading)
+                    Text("Look at the moment before you, then choose the reflection you need. Tevari captures one photo only after you choose.", style: .body, color: .secondary)
+                    Button(label: "Find Scripture", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.captureFaithLens(question: "What Scripture speaks to this moment?") }
+                    })
+                    Button(label: "Offer a prayer", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.captureFaithLens(question: "What is a short prayer for this moment?") }
+                    })
+                    Button(label: "Ask a question", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.startFaithLensListeningFromGlasses() }
+                    })
+                    Button(label: "Stop camera", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens camera controls: \(error.localizedDescription)" }
+    }
+
+    // The current public Display DSL has no animation primitive. This strong,
+    // high-contrast listening state is sent once rather than repeatedly
+    // replacing the glasses view while audio is being transcribed.
+    private func sendFaithLensListeningStartingCard() async {
+        guard let display else { return }
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("● Preparing microphone", style: .heading)
+                    Text("Connecting to your glasses microphone…", style: .body, color: .secondary)
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens microphone status: \(error.localizedDescription)" }
+    }
+
+    private func sendFaithLensListeningCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("● Listening", style: .heading)
+                    Text("Speak your question naturally. Tevari is listening through your glasses microphone.", style: .body, color: .secondary)
+                    Button(label: "I'm done speaking", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.finishFaithLensListeningFromGlasses() }
+                    })
+                    Button(label: "Cancel", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in
+                            service.stopFaithLensListening()
+                            await service.sendFaithLensCameraReadyCard()
+                        }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens listening state: \(error.localizedDescription)" }
+    }
+
+    private func sendFaithLensQuestionReviewCard(_ question: String) async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("I heard", style: .heading)
+                    Text(question, style: .body)
+                    Text("Send this question with one captured moment?", style: .body, color: .secondary)
+                    Button(label: "Send", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.sendFaithLensSpokenQuestion() }
+                    })
+                    Button(label: "Try again", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.startFaithLensListeningFromGlasses() }
+                    })
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens question review: \(error.localizedDescription)" }
+    }
+
+    private func sendFaithLensQuestionNotHeardCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("I didn't hear a question", style: .heading)
+                    Text("Keep your glasses connected and speak a little closer to the microphone, then try again.", style: .body, color: .secondary)
+                    Button(label: "Try again", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.startFaithLensListeningFromGlasses() }
+                    })
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens retry state: \(error.localizedDescription)" }
+    }
+
+    private func sendFaithLensReflectingCard() async {
+        guard let display else { return }
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Faith Lens", style: .heading)
+                    Text("Reflecting on this moment…", style: .body, color: .secondary)
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens reflection status: \(error.localizedDescription)" }
+    }
+
+    private func sendFaithLensCameraErrorCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Camera unavailable", style: .heading)
+                    Text("Keep your glasses open, worn, and connected in Meta AI, then try again.", style: .body, color: .secondary)
+                    Button(label: "Try again", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.startFaithLensCamera() }
+                    })
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Faith Lens camera error: \(error.localizedDescription)" }
     }
 
     private func sendFaithLensResponseCard(_ result: TevariFaithLensResponse) async {
