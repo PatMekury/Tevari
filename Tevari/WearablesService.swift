@@ -27,6 +27,8 @@ final class WearablesService: ObservableObject {
     @Published private(set) var latestFaithLensFrame: UIImage?
     @Published private(set) var faithLensResponse: TevariFaithLensResponse?
     @Published private(set) var faithLensQuestion = ""
+    @Published private(set) var storyStatus = "Not started"
+    @Published private(set) var storyScene: TevariStoryScene?
     @Published var errorMessage: String?
 
     private var registrationTask: Task<Void, Never>?
@@ -44,6 +46,10 @@ final class WearablesService: ObservableObject {
     private var isRequestingFaithLensCamera = false
     private var hasPresentedFaithLensCameraControls = false
     private var pendingFaithLensQuestion: String?
+    private var storyPrompt = ""
+    private var storyTranscriptUpdateTask: Task<Void, Never>?
+    private var storyAudioPlayer: AVAudioPlayer?
+    private var storyAudioURL: URL?
     private let faithLensSpeechSynthesizer = AVSpeechSynthesizer()
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     // Recreated after an audio-route change so the engine does not retain the
@@ -59,6 +65,8 @@ final class WearablesService: ObservableObject {
     private var isRequestingLivePrompt = false
     private var isShowingPrayerPrompt = false
     private var lastPromptWordCount = 0
+    private enum SpeechCaptureDestination { case none, faithLens, story }
+    private var speechCaptureDestination: SpeechCaptureDestination = .none
     // DAT accepts one display update at a time. Speech recognition, a live
     // prompt, and a button action can otherwise race and cause the SDK to
     // supersede a card that is still being delivered.
@@ -148,6 +156,7 @@ final class WearablesService: ObservableObject {
     func stopGlassesExperience() {
         stopPrayerListening()
         stopFaithLensCamera()
+        stopStoryNarration()
         display?.stop()
         deviceSession?.stop()
         isExperienceActive = false
@@ -166,6 +175,7 @@ final class WearablesService: ObservableObject {
     func returnToGlassesHome() {
         stopPrayerListening()
         stopFaithLensCamera()
+        stopStoryNarration()
         glassesRouteTitle = "Home"
         Task { await sendGlassesHomeCard() }
     }
@@ -179,6 +189,99 @@ final class WearablesService: ObservableObject {
         faithLensStatus = "Ready to start camera"
         faithLensResponse = nil
         Task { await sendFaithLensEntryCard() }
+    }
+
+    func openStory() {
+        stopFaithLensCamera()
+        stopPrayerListening()
+        storyTranscriptUpdateTask?.cancel()
+        glassesRouteTitle = "Story"
+        storyStatus = "Ready for your prompt"
+        storyPrompt = ""
+        storyScene = nil
+        Task { await sendStoryEntryCard() }
+    }
+
+    func startStoryListening() {
+        guard !audioEngine.isRunning else { return }
+        Task {
+            errorMessage = nil
+            storyPrompt = ""
+            storyStatus = "Preparing glasses microphone"
+            guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
+                storyStatus = "Microphone permission needed"
+                errorMessage = "Allow Microphone and Speech Recognition for Tevari in iPhone Settings, then try your Story prompt again."
+                await sendStoryEntryCard()
+                return
+            }
+            do {
+                try await beginStorySpeechRecognition()
+                storyStatus = "Listening"
+                await sendStoryListeningCard()
+            } catch {
+                storyStatus = "Could not listen"
+                errorMessage = "Tevari could not start the glasses microphone: \(error.localizedDescription)"
+                await sendStoryEntryCard()
+            }
+        }
+    }
+
+    func finishStoryListening() {
+        stopFaithLensListening()
+        let prompt = storyPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else {
+            storyStatus = "No prompt heard"
+            errorMessage = "Tevari did not hear a story prompt. Try again with your glasses microphone connected."
+            Task { await sendStoryEntryCard() }
+            return
+        }
+        storyStatus = "Prompt ready"
+        Task { await sendStoryPromptReviewCard(prompt) }
+    }
+
+    func startStory(prompt: String) {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        stopFaithLensListening()
+        storyStatus = "Preparing your story"
+        Task { await sendStoryPreparingCard() }
+        Task {
+            do {
+                let scene = try await TevariAPI.storyScene(prompt: trimmed)
+                storyScene = scene
+                storyStatus = "Scene ready"
+                await sendStorySceneCard(scene)
+            } catch {
+                storyStatus = "Could not prepare story"
+                errorMessage = error.localizedDescription
+                await sendStoryEntryCard()
+            }
+        }
+    }
+
+    func playStoryNarration() {
+        guard let scene = storyScene else { return }
+        storyStatus = "Preparing narration"
+        Task {
+            do {
+                await sendStoryNarrationStartingCard()
+                let audioData = try await TevariAPI.storyNarration(scene.narration)
+                try await routeStoryNarrationToGlasses()
+                let audioURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("tevari-story-narration-\(UUID().uuidString).wav")
+                try audioData.write(to: audioURL, options: .atomic)
+                storyAudioURL = audioURL
+                storyAudioPlayer = try AVAudioPlayer(contentsOf: audioURL)
+                storyAudioPlayer?.prepareToPlay()
+                storyAudioPlayer?.play()
+                storyStatus = "Narrating"
+                await sendStoryNarratingCard(scene)
+            } catch {
+                storyStatus = "Narration unavailable"
+                errorMessage = error.localizedDescription
+                await sendStoryMoreCard(scene)
+            }
+        }
     }
 
     func startFaithLensCamera() {
@@ -292,6 +395,7 @@ final class WearablesService: ObservableObject {
         Task {
             errorMessage = nil
             faithLensQuestion = ""
+            speechCaptureDestination = .faithLens
             guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
                 faithLensStatus = "Microphone permission needed"
                 errorMessage = "Allow Microphone and Speech Recognition for Tevari in iPhone Settings, then try Faith Lens again."
@@ -315,6 +419,7 @@ final class WearablesService: ObservableObject {
         Task {
             errorMessage = nil
             faithLensQuestion = ""
+            speechCaptureDestination = .faithLens
             faithLensStatus = "Preparing glasses microphone"
             await sendFaithLensListeningStartingCard()
             guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
@@ -364,7 +469,44 @@ final class WearablesService: ObservableObject {
         let audioSession = AVAudioSession.sharedInstance()
         try? audioSession.setPreferredInput(nil)
         try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+        storyTranscriptUpdateTask?.cancel()
+        speechCaptureDestination = .none
         if faithLensStatus == "Listening for your question" { faithLensStatus = "Question ready" }
+    }
+
+    private func stopStoryNarration() {
+        storyAudioPlayer?.stop()
+        storyAudioPlayer = nil
+        if let storyAudioURL { try? FileManager.default.removeItem(at: storyAudioURL) }
+        storyAudioURL = nil
+        try? AVAudioSession.sharedInstance().setPreferredInput(nil)
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    /// While a DAT session is active, the glasses expose their speakers through
+    /// the same Bluetooth HFP route used for the glasses microphone. Selecting
+    /// that input explicitly routes duplex audio to the glasses, unlike A2DP
+    /// playback, which iOS removes from Control Center during the session.
+    private func routeStoryNarrationToGlasses() async throws {
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
+        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        guard let glassesInput = audioSession.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) else {
+            throw NSError(
+                domain: "Tevari",
+                code: 7,
+                userInfo: [NSLocalizedDescriptionKey: "Glasses audio is unavailable. Reconnect your glasses in Meta AI, then try Hear narration again."]
+            )
+        }
+        try audioSession.setPreferredInput(glassesInput)
+        try await Task.sleep(for: .milliseconds(450))
+        guard audioSession.currentRoute.outputs.contains(where: { $0.portType == .bluetoothHFP }) else {
+            throw NSError(
+                domain: "Tevari",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Tevari could not route narration to your glasses speakers."]
+            )
+        }
     }
 
     func stopFaithLensCamera() {
@@ -426,10 +568,67 @@ final class WearablesService: ObservableObject {
         recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
             Task { @MainActor in
                 guard let self else { return }
-                if let text = result?.bestTranscription.formattedString, !text.isEmpty { self.faithLensQuestion = text }
+                if let text = result?.bestTranscription.formattedString, !text.isEmpty {
+                    switch self.speechCaptureDestination {
+                    case .faithLens:
+                        self.faithLensQuestion = text
+                    case .story:
+                        self.storyPrompt = text
+                        self.scheduleStoryTranscriptUpdate()
+                    case .none:
+                        break
+                    }
+                }
                 // Cancellation is expected when the user taps Capture or Stop.
                 if let error, self.audioEngine.isRunning {
                     self.errorMessage = "Faith Lens stopped listening: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    /// Story deliberately mirrors Prayer's microphone lifecycle. It clears the
+    /// old audio session before selecting glasses HFP, then shows Tevari's own
+    /// listening surface only after the route has settled.
+    private func beginStorySpeechRecognition() async throws {
+        guard let speechRecognizer, speechRecognizer.isAvailable else {
+            throw NSError(domain: "Tevari", code: 9, userInfo: [NSLocalizedDescriptionKey: "Speech Recognition is unavailable right now."])
+        }
+        stopFaithLensListening()
+        speechCaptureDestination = .story
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
+        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        guard let hfpInput = audioSession.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) else {
+            throw NSError(domain: "Tevari", code: 10, userInfo: [NSLocalizedDescriptionKey: "Glasses microphone is unavailable. Reconnect your glasses in Meta AI and try again."])
+        }
+        try audioSession.setPreferredInput(hfpInput)
+        try await Task.sleep(for: .seconds(2))
+        guard audioSession.currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) else {
+            try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+            throw NSError(domain: "Tevari", code: 11, userInfo: [NSLocalizedDescriptionKey: "Tevari could not route audio to your glasses microphone."])
+        }
+
+        audioEngine = AVAudioEngine()
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        recognitionRequest = request
+        let input = audioEngine.inputNode
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1_024, format: input.inputFormat(forBus: 0)) { [weak self] buffer, _ in
+            self?.recognitionRequest?.append(buffer)
+        }
+        audioEngine.prepare()
+        try audioEngine.start()
+        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            Task { @MainActor in
+                guard let self else { return }
+                if let text = result?.bestTranscription.formattedString, !text.isEmpty {
+                    self.storyPrompt = text
+                    self.scheduleStoryTranscriptUpdate()
+                }
+                if let error, self.audioEngine.isRunning {
+                    self.errorMessage = "Story stopped listening: \(error.localizedDescription)"
                 }
             }
         }
@@ -668,6 +867,9 @@ final class WearablesService: ObservableObject {
                     Button(label: "Faith Lens", style: .primary, iconName: .checkmark, onClick: {
                         Task { @MainActor [service] in service.openFaithLens() }
                     })
+                    Button(label: "Story", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.openStory() }
+                    })
                     Button(label: "Done", style: .primary, iconName: .checkmark, onClick: {
                         Task { @MainActor [service] in service.stopGlassesExperience() }
                     })
@@ -905,6 +1107,205 @@ final class WearablesService: ObservableObject {
                 }.padding(24).background(.card)
             )
         } catch { errorMessage = "Could not show Faith Lens response: \(error.localizedDescription)" }
+    }
+
+    private func sendStoryEntryCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Bible Story", style: .heading)
+                    Text("Ask for a person, a moment, or what you need today. Tevari creates one short scene, then grounds it in Scripture.", style: .body, color: .secondary)
+                    Button(label: "Speak a prompt", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.startStoryListening() }
+                    })
+                    Button(label: "Story for courage", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in
+                            service.startStory(prompt: "Tell me a Bible story about courage when I feel afraid.")
+                        }
+                    })
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Story: \(error.localizedDescription)" }
+    }
+
+    private func sendStoryListeningCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("● Listening", style: .heading)
+                    Text("Tell Tevari the Bible story you want to hear through your glasses microphone.", style: .body, color: .secondary)
+                    if !storyPrompt.isEmpty {
+                        Text(storyPrompt, style: .body)
+                    }
+                    Button(label: "I'm done speaking", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.finishStoryListening() }
+                    })
+                    Button(label: "Cancel", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in
+                            service.stopFaithLensListening()
+                            await service.sendStoryEntryCard()
+                        }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Story listening state: \(error.localizedDescription)" }
+    }
+
+    /// Display updates are deliberately throttled so each partial transcript
+    /// replaces the glasses card cleanly instead of fighting the DAT display
+    /// transport on every speech-recognition callback.
+    private func scheduleStoryTranscriptUpdate() {
+        storyTranscriptUpdateTask?.cancel()
+        storyTranscriptUpdateTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard let self, !Task.isCancelled,
+                  self.speechCaptureDestination == .story,
+                  self.audioEngine.isRunning else { return }
+            await self.sendStoryListeningCard()
+        }
+    }
+
+    private func sendStoryPromptReviewCard(_ prompt: String) async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("I heard", style: .heading)
+                    Text(prompt, style: .body)
+                    Text("Send this to Tevari?", style: .body, color: .secondary)
+                    Button(label: "Send", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.startStory(prompt: prompt) }
+                    })
+                    Button(label: "Try again", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.startStoryListening() }
+                    })
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in await service.sendStoryEntryCard() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Story prompt review: \(error.localizedDescription)" }
+    }
+
+    private func sendStoryPreparingCard() async {
+        guard let display else { return }
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Tevari Story", style: .heading)
+                    Text("Creating your next scene and finding the Scripture…", style: .body, color: .secondary)
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Story status: \(error.localizedDescription)" }
+    }
+
+    private func sendStoryNarrationStartingCard() async {
+        guard let display else { return }
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Tevari Story", style: .heading)
+                    Text("Preparing the narration…", style: .body, color: .secondary)
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show narration status: \(error.localizedDescription)" }
+    }
+
+    private func sendStoryNarratingCard(_ scene: TevariStoryScene) async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Now telling", style: .heading)
+                    Text(scene.title, style: .body, color: .secondary)
+                    Text("The narration is playing through your selected glasses audio.", style: .body)
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in
+                            service.stopStoryNarration()
+                            await service.sendStoryMoreCard(scene)
+                        }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show narration playback: \(error.localizedDescription)" }
+    }
+
+    private func sendStorySceneCard(_ scene: TevariStoryScene) async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text(scene.title, style: .heading)
+                    Text(scene.guide, style: .body)
+                    Text("Scripture · \(scene.scripture.reference)", style: .body, color: .secondary)
+                    Button(label: "Continue", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in
+                            service.startStory(prompt: "Continue the Bible story from \(scene.scripture.reference) as the next short scene.")
+                        }
+                    })
+                    Button(label: "More", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in await service.sendStoryMoreCard(scene) }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Story scene: \(error.localizedDescription)" }
+    }
+
+    private func sendStoryMoreCard(_ scene: TevariStoryScene) async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("More", style: .heading)
+                    Text(scene.title, style: .body, color: .secondary)
+                    Button(label: "Hear narration", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.playStoryNarration() }
+                    })
+                    Button(label: "Read Scripture", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in await service.sendStoryScriptureCard(scene) }
+                    })
+                    Button(label: "Pray from this", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in service.openPrayerExperience() }
+                    })
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in
+                            service.stopStoryNarration()
+                            service.storyScene = nil
+                            await service.sendStoryEntryCard()
+                        }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Story options: \(error.localizedDescription)" }
+    }
+
+    private func sendStoryScriptureCard(_ scene: TevariStoryScene) async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Scripture", style: .heading)
+                    Text(scene.scripture.reference, style: .body, color: .secondary)
+                    Text(scene.scripture.content, style: .body)
+                    Text("NIV11 · YouVersion", style: .body, color: .secondary)
+                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                        Task { @MainActor [service] in await service.sendStoryMoreCard(scene) }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Story Scripture: \(error.localizedDescription)" }
     }
 
     private func sendPrayerEntryCardImmediately() async {

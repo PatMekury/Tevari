@@ -16,3 +16,7 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output/
+
+# Python service build artifacts
+__pycache__/
+*.pyc
