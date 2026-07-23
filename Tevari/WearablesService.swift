@@ -12,6 +12,22 @@ import UIKit
 /// after the user starts a session.
 @MainActor
 final class WearablesService: ObservableObject {
+    enum Tradition: String, CaseIterable {
+        case general
+        case evangelical
+        case catholic
+        case mainline
+
+        var label: String {
+            switch self {
+            case .general: "No preference"
+            case .evangelical: "Evangelical"
+            case .catholic: "Catholic"
+            case .mainline: "Protestant"
+            }
+        }
+    }
+
     @Published private(set) var registrationStatus = "Not connected"
     @Published private(set) var sessionStatus = "Not started"
     @Published private(set) var displayStatus = "Not started"
@@ -29,6 +45,7 @@ final class WearablesService: ObservableObject {
     @Published private(set) var faithLensQuestion = ""
     @Published private(set) var storyStatus = "Not started"
     @Published private(set) var storyScene: TevariStoryScene?
+    @Published private(set) var tradition: Tradition = .general
     @Published var errorMessage: String?
 
     private var registrationTask: Task<Void, Never>?
@@ -47,7 +64,9 @@ final class WearablesService: ObservableObject {
     private var hasPresentedFaithLensCameraControls = false
     private var pendingFaithLensQuestion: String?
     private var storyPrompt = ""
+    private var hasStartedStoryCapture = false
     private var storyTranscriptUpdateTask: Task<Void, Never>?
+    private var faithLensTranscriptUpdateTask: Task<Void, Never>?
     private var storyAudioPlayer: AVAudioPlayer?
     private var storyAudioURL: URL?
     private let faithLensSpeechSynthesizer = AVSpeechSynthesizer()
@@ -65,7 +84,7 @@ final class WearablesService: ObservableObject {
     private var isRequestingLivePrompt = false
     private var isShowingPrayerPrompt = false
     private var lastPromptWordCount = 0
-    private enum SpeechCaptureDestination { case none, faithLens, story }
+    private enum SpeechCaptureDestination { case none, prayer, faithLens, story }
     private var speechCaptureDestination: SpeechCaptureDestination = .none
     // DAT accepts one display update at a time. Speech recognition, a live
     // prompt, and a button action can otherwise race and cause the SDK to
@@ -81,8 +100,17 @@ final class WearablesService: ObservableObject {
     /// This must begin listening before the user starts a session. DAT updates
     /// the selector as glasses become available after Meta AI registration.
     private var displayDeviceSelector: AutoDeviceSelector
+    private static let traditionDefaultsKey = "tevari.glasses.tradition"
+
+    private var hasSelectedTradition: Bool {
+        UserDefaults.standard.string(forKey: Self.traditionDefaultsKey) != nil
+    }
 
     init() {
+        if let stored = UserDefaults.standard.string(forKey: Self.traditionDefaultsKey),
+           let storedTradition = Tradition(rawValue: stored) {
+            tradition = storedTradition
+        }
         displayDeviceSelector = AutoDeviceSelector(
             wearables: Wearables.shared,
             filter: { $0.supportsDisplay() }
@@ -167,6 +195,12 @@ final class WearablesService: ObservableObject {
     /// Enters Prayer from the active glasses application. This is display-only
     /// until the user explicitly begins a spoken prayer in the next step.
     func openPrayerExperience() {
+        // Prayer may be entered from Story after narration. Clear that HFP
+        // playback session first so Prayer starts from the same clean state as
+        // the known-good home-screen prayer flow.
+        stopStoryNarration()
+        stopFaithLensCamera()
+        stopPrayerListening()
         glassesRouteTitle = "Prayer"
         prayerStatus = "Ready"
         Task { await sendPrayerEntryCard() }
@@ -198,12 +232,20 @@ final class WearablesService: ObservableObject {
         glassesRouteTitle = "Story"
         storyStatus = "Ready for your prompt"
         storyPrompt = ""
+        hasStartedStoryCapture = false
         storyScene = nil
         Task { await sendStoryEntryCard() }
     }
 
+    func selectTradition(_ selection: Tradition) {
+        tradition = selection
+        UserDefaults.standard.set(selection.rawValue, forKey: Self.traditionDefaultsKey)
+        Task { await sendGlassesHomeCardImmediately() }
+    }
+
     func startStoryListening() {
         guard !audioEngine.isRunning else { return }
+        hasStartedStoryCapture = true
         Task {
             errorMessage = nil
             storyPrompt = ""
@@ -215,7 +257,7 @@ final class WearablesService: ObservableObject {
                 return
             }
             do {
-                try await beginStorySpeechRecognition()
+                try await beginGlassesSpeechRecognition(destination: .story)
                 storyStatus = "Listening"
                 await sendStoryListeningCard()
             } catch {
@@ -236,10 +278,13 @@ final class WearablesService: ObservableObject {
             return
         }
         storyStatus = "Prompt ready"
-        Task { await sendStoryPromptReviewCard(prompt) }
+        Task {
+            await restoreGlassesMediaRouteAfterStoryCapture()
+            await sendStoryPromptReviewCard(prompt)
+        }
     }
 
-    func startStory(prompt: String) {
+    func startStory(prompt: String, continuationPassageID: String? = nil) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         stopFaithLensListening()
@@ -247,7 +292,11 @@ final class WearablesService: ObservableObject {
         Task { await sendStoryPreparingCard() }
         Task {
             do {
-                let scene = try await TevariAPI.storyScene(prompt: trimmed)
+                let scene = try await TevariAPI.storyScene(
+                    prompt: trimmed,
+                    tradition: tradition.rawValue,
+                    continuationPassageID: continuationPassageID
+                )
                 storyScene = scene
                 storyStatus = "Scene ready"
                 await sendStorySceneCard(scene)
@@ -375,7 +424,10 @@ final class WearablesService: ObservableObject {
         stopFaithLensListening()
         let audioSession = AVAudioSession.sharedInstance()
         do {
-            try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.allowBluetoothA2DP])
+            // A playback session follows the selected media output by default.
+            // Passing the HFP/A2DP capture option here causes OSStatus -50 on
+            // some glasses routes.
+            try audioSession.setCategory(.playback, mode: .spokenAudio)
             try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             errorMessage = "Faith Lens could not prepare audio: \(error.localizedDescription)"
@@ -402,7 +454,7 @@ final class WearablesService: ObservableObject {
                 return
             }
             do {
-                try await beginFaithLensSpeechRecognition()
+                try await beginGlassesSpeechRecognition(destination: .faithLens)
                 faithLensStatus = "Listening for your question"
             } catch {
                 faithLensStatus = "Could not listen"
@@ -419,9 +471,7 @@ final class WearablesService: ObservableObject {
         Task {
             errorMessage = nil
             faithLensQuestion = ""
-            speechCaptureDestination = .faithLens
             faithLensStatus = "Preparing glasses microphone"
-            await sendFaithLensListeningStartingCard()
             guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
                 faithLensStatus = "Microphone permission needed"
                 errorMessage = "Allow Microphone and Speech Recognition for Tevari in iPhone Settings, then try your Faith Lens question again."
@@ -429,7 +479,7 @@ final class WearablesService: ObservableObject {
                 return
             }
             do {
-                try await beginFaithLensSpeechRecognition()
+                try await beginGlassesSpeechRecognition(destination: .faithLens)
                 faithLensStatus = "Listening for your question"
                 await sendFaithLensListeningCard()
             } catch {
@@ -470,6 +520,7 @@ final class WearablesService: ObservableObject {
         try? audioSession.setPreferredInput(nil)
         try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
         storyTranscriptUpdateTask?.cancel()
+        faithLensTranscriptUpdateTask?.cancel()
         speechCaptureDestination = .none
         if faithLensStatus == "Listening for your question" { faithLensStatus = "Question ready" }
     }
@@ -483,29 +534,42 @@ final class WearablesService: ObservableObject {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
-    /// While a DAT session is active, the glasses expose their speakers through
-    /// the same Bluetooth HFP route used for the glasses microphone. Selecting
-    /// that input explicitly routes duplex audio to the glasses, unlike A2DP
-    /// playback, which iOS removes from Control Center during the session.
+    /// Narration must use the glasses' media route, never the HFP microphone
+    /// route. HFP makes iOS show the call surface over the glasses display;
+    /// A2DP is the normal glasses-speaker route for spoken media.
     private func routeStoryNarrationToGlasses() async throws {
         let audioSession = AVAudioSession.sharedInstance()
-        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
+        try? audioSession.setPreferredInput(nil)
+        try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+        try await Task.sleep(for: .milliseconds(450))
+        // `.allowBluetoothA2DP` is not a valid option on a playback-only
+        // session and produces OSStatus -50. Playback automatically follows
+        // the user's selected glasses media route.
+        try audioSession.setCategory(.playback, mode: .spokenAudio)
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-        guard let glassesInput = audioSession.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) else {
+        guard audioSession.currentRoute.outputs.contains(where: { $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE }) else {
             throw NSError(
                 domain: "Tevari",
                 code: 7,
-                userInfo: [NSLocalizedDescriptionKey: "Glasses audio is unavailable. Reconnect your glasses in Meta AI, then try Hear narration again."]
+                userInfo: [NSLocalizedDescriptionKey: "Glasses media audio is unavailable. Select your glasses as the iPhone audio output, then try Hear narration again."]
             )
         }
-        try audioSession.setPreferredInput(glassesInput)
-        try await Task.sleep(for: .milliseconds(450))
-        guard audioSession.currentRoute.outputs.contains(where: { $0.portType == .bluetoothHFP }) else {
-            throw NSError(
-                domain: "Tevari",
-                code: 8,
-                userInfo: [NSLocalizedDescriptionKey: "Tevari could not route narration to your glasses speakers."]
-            )
+    }
+
+    /// Speech capture uses the glasses' HFP microphone. Before presenting the
+    /// Story review/retry controls, return to the same normal media route used
+    /// by narration so a following prompt does not inherit call-style state.
+    private func restoreGlassesMediaRouteAfterStoryCapture() async {
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setPreferredInput(nil)
+        try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+        try? await Task.sleep(for: .milliseconds(250))
+        do {
+            try audioSession.setCategory(.playback, mode: .spokenAudio)
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        } catch {
+            // The next capture still has its own route setup. Do not block the
+            // prompt-review card if the glasses media route is briefly absent.
         }
     }
 
@@ -528,7 +592,7 @@ final class WearablesService: ObservableObject {
         pendingFaithLensQuestion = nil
         faithLensStatus = "Reflecting on this moment"
         do {
-            let response = try await TevariAPI.faithLens(imageData: data, question: question)
+            let response = try await TevariAPI.faithLens(imageData: data, question: question, tradition: tradition.rawValue)
             faithLensResponse = response
             faithLensStatus = "Reflection ready"
             await sendFaithLensResponseCard(response)
@@ -539,21 +603,32 @@ final class WearablesService: ObservableObject {
         }
     }
 
-    private func beginFaithLensSpeechRecognition() async throws {
+    /// The one and only glasses microphone lifecycle. Prayer is the working
+    /// reference implementation, so Story and Faith Lens use this exact route
+    /// setup—not a parallel "call"-style session—on first prompt and retry.
+    private func beginGlassesSpeechRecognition(destination: SpeechCaptureDestination) async throws {
         guard let speechRecognizer, speechRecognizer.isAvailable else {
-            throw NSError(domain: "Tevari", code: 4, userInfo: [NSLocalizedDescriptionKey: "Speech Recognition is unavailable right now."])
+            throw NSError(domain: "Tevari", code: 1, userInfo: [NSLocalizedDescriptionKey: "Speech Recognition is unavailable right now."])
         }
+        // This is deliberately the same reset Prayer has always used.
+        stopPrayerListening()
+        speechCaptureDestination = destination
+        if destination == .prayer { prayerTranscript = "" }
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         guard let hfpInput = audioSession.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) else {
-            throw NSError(domain: "Tevari", code: 5, userInfo: [NSLocalizedDescriptionKey: "Glasses microphone is unavailable. Reconnect your glasses in Meta AI and try again."])
+            throw NSError(domain: "Tevari", code: 2, userInfo: [NSLocalizedDescriptionKey: "Glasses microphone is unavailable. Reconnect your glasses in Meta AI and try again."])
         }
         try audioSession.setPreferredInput(hfpInput)
+        if destination == .prayer { prayerStatus = "Connecting glasses microphone" }
         try await Task.sleep(for: .seconds(2))
         guard audioSession.currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) else {
-            throw NSError(domain: "Tevari", code: 6, userInfo: [NSLocalizedDescriptionKey: "Tevari could not route audio to your glasses microphone."])
+            try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+            throw NSError(domain: "Tevari", code: 3, userInfo: [NSLocalizedDescriptionKey: "Tevari could not route audio to your glasses microphone."])
         }
+        // Construct the engine only after HFP settles, so it captures the
+        // glasses microphone format rather than retaining the iPhone format.
         audioEngine = AVAudioEngine()
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
@@ -569,9 +644,13 @@ final class WearablesService: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 if let text = result?.bestTranscription.formattedString, !text.isEmpty {
-                    switch self.speechCaptureDestination {
+                    switch destination {
+                    case .prayer:
+                        self.prayerTranscript = text
+                        if !self.isShowingPrayerPrompt { await self.sendListeningCard() }
                     case .faithLens:
                         self.faithLensQuestion = text
+                        self.scheduleFaithLensTranscriptUpdate()
                     case .story:
                         self.storyPrompt = text
                         self.scheduleStoryTranscriptUpdate()
@@ -579,56 +658,12 @@ final class WearablesService: ObservableObject {
                         break
                     }
                 }
-                // Cancellation is expected when the user taps Capture or Stop.
                 if let error, self.audioEngine.isRunning {
-                    self.errorMessage = "Faith Lens stopped listening: \(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    /// Story deliberately mirrors Prayer's microphone lifecycle. It clears the
-    /// old audio session before selecting glasses HFP, then shows Tevari's own
-    /// listening surface only after the route has settled.
-    private func beginStorySpeechRecognition() async throws {
-        guard let speechRecognizer, speechRecognizer.isAvailable else {
-            throw NSError(domain: "Tevari", code: 9, userInfo: [NSLocalizedDescriptionKey: "Speech Recognition is unavailable right now."])
-        }
-        stopFaithLensListening()
-        speechCaptureDestination = .story
-        let audioSession = AVAudioSession.sharedInstance()
-        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
-        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-        guard let hfpInput = audioSession.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) else {
-            throw NSError(domain: "Tevari", code: 10, userInfo: [NSLocalizedDescriptionKey: "Glasses microphone is unavailable. Reconnect your glasses in Meta AI and try again."])
-        }
-        try audioSession.setPreferredInput(hfpInput)
-        try await Task.sleep(for: .seconds(2))
-        guard audioSession.currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) else {
-            try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-            throw NSError(domain: "Tevari", code: 11, userInfo: [NSLocalizedDescriptionKey: "Tevari could not route audio to your glasses microphone."])
-        }
-
-        audioEngine = AVAudioEngine()
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        recognitionRequest = request
-        let input = audioEngine.inputNode
-        input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1_024, format: input.inputFormat(forBus: 0)) { [weak self] buffer, _ in
-            self?.recognitionRequest?.append(buffer)
-        }
-        audioEngine.prepare()
-        try audioEngine.start()
-        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
-            Task { @MainActor in
-                guard let self else { return }
-                if let text = result?.bestTranscription.formattedString, !text.isEmpty {
-                    self.storyPrompt = text
-                    self.scheduleStoryTranscriptUpdate()
-                }
-                if let error, self.audioEngine.isRunning {
-                    self.errorMessage = "Story stopped listening: \(error.localizedDescription)"
+                    if destination == .prayer, !self.isFinishingCapture {
+                        self.prayerStatus = "Listening stopped"
+                        self.stopPrayerListening()
+                    }
+                    self.errorMessage = "Tevari stopped listening: \(error.localizedDescription)"
                 }
             }
         }
@@ -804,7 +839,7 @@ final class WearablesService: ObservableObject {
                     switch state {
                     case .started:
                         self.isExperienceActive = true
-                        await self.sendGlassesHomeCard()
+                        await self.sendInitialGlassesSurface()
                     case .stopping, .stopped:
                         self.isExperienceActive = false
                     case .starting:
@@ -853,6 +888,14 @@ final class WearablesService: ObservableObject {
         queueDisplayCard(.home)
     }
 
+    private func sendInitialGlassesSurface() async {
+        if hasSelectedTradition {
+            await sendGlassesHomeCard()
+        } else {
+            await sendTraditionSelectionCard()
+        }
+    }
+
     private func sendGlassesHomeCardImmediately() async {
         guard let display else { return }
         let service = self
@@ -861,16 +904,17 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("Tevari", style: .heading)
                     Text("Scripture for the moment you are in.", style: .body, color: .secondary)
-                    Button(label: "Pray", style: .primary, iconName: .checkmark, onClick: {
+                    Text("Personalized for \(tradition.label).", style: .body, color: .secondary)
+                    Button(label: "Pray", style: .primary, onClick: {
                         Task { @MainActor [service] in service.openPrayerExperience() }
                     })
-                    Button(label: "Faith Lens", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Faith Lens", style: .primary, onClick: {
                         Task { @MainActor [service] in service.openFaithLens() }
                     })
-                    Button(label: "Story", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Story", style: .primary, onClick: {
                         Task { @MainActor [service] in service.openStory() }
                     })
-                    Button(label: "Done", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Done", style: .primary, onClick: {
                         Task { @MainActor [service] in service.stopGlassesExperience() }
                     })
                 }
@@ -880,6 +924,31 @@ final class WearablesService: ObservableObject {
         } catch {
             errorMessage = "Could not send the Tevari display card: \(error.localizedDescription)"
         }
+    }
+
+    private func sendTraditionSelectionCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Faith background", style: .heading)
+                    Text("Choose the perspective Tevari should use for prayer, stories, and reflections.", style: .body, color: .secondary)
+                    Button(label: "Evangelical", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.selectTradition(.evangelical) }
+                    })
+                    Button(label: "Catholic", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.selectTradition(.catholic) }
+                    })
+                    Button(label: "Protestant", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.selectTradition(.mainline) }
+                    })
+                    Button(label: "No preference", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.selectTradition(.general) }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show tradition selection: \(error.localizedDescription)" }
     }
 
     private func sendPrayerEntryCard() async {
@@ -894,10 +963,10 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("Faith Lens", style: .heading)
                     Text("Start the camera, then ask Tevari about what is before you. One frame is captured only when you ask.", style: .body, color: .secondary)
-                    Button(label: "Start camera", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Start camera", style: .primary, onClick: {
                         Task { @MainActor [service] in service.startFaithLensCamera() }
                     })
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in service.returnToGlassesHome() }
                     })
                 }.padding(24).background(.card)
@@ -915,7 +984,7 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("Faith Lens", style: .heading)
                     Text("Allow Camera access in Meta AI, then return here. Tevari uses your glasses camera only for the moment you choose to capture.", style: .body, color: .secondary)
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in service.returnToGlassesHome() }
                     })
                 }.padding(24).background(.card)
@@ -943,10 +1012,10 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("Camera permission needed", style: .heading)
                     Text("In Meta AI, allow Tevari to use your glasses camera. Then come back and choose Start camera.", style: .body, color: .secondary)
-                    Button(label: "Try again", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Try again", style: .primary, onClick: {
                         Task { @MainActor [service] in service.startFaithLensCamera() }
                     })
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in service.returnToGlassesHome() }
                     })
                 }.padding(24).background(.card)
@@ -962,16 +1031,16 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("Faith Lens is live", style: .heading)
                     Text("Look at the moment before you, then choose the reflection you need. Tevari captures one photo only after you choose.", style: .body, color: .secondary)
-                    Button(label: "Find Scripture", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Find Scripture", style: .primary, onClick: {
                         Task { @MainActor [service] in service.captureFaithLens(question: "What Scripture speaks to this moment?") }
                     })
-                    Button(label: "Offer a prayer", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Offer a prayer", style: .primary, onClick: {
                         Task { @MainActor [service] in service.captureFaithLens(question: "What is a short prayer for this moment?") }
                     })
-                    Button(label: "Ask a question", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Ask a question", style: .primary, onClick: {
                         Task { @MainActor [service] in service.startFaithLensListeningFromGlasses() }
                     })
-                    Button(label: "Stop camera", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Stop camera", style: .primary, onClick: {
                         Task { @MainActor [service] in service.returnToGlassesHome() }
                     })
                 }.padding(24).background(.card)
@@ -1002,10 +1071,13 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("● Listening", style: .heading)
                     Text("Speak your question naturally. Tevari is listening through your glasses microphone.", style: .body, color: .secondary)
-                    Button(label: "I'm done speaking", style: .primary, iconName: .checkmark, onClick: {
+                    if !faithLensQuestion.isEmpty {
+                        Text(faithLensQuestion, style: .body)
+                    }
+                    Button(label: "I'm done speaking", style: .primary, onClick: {
                         Task { @MainActor [service] in service.finishFaithLensListeningFromGlasses() }
                     })
-                    Button(label: "Cancel", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Cancel", style: .primary, onClick: {
                         Task { @MainActor [service] in
                             service.stopFaithLensListening()
                             await service.sendFaithLensCameraReadyCard()
@@ -1025,13 +1097,13 @@ final class WearablesService: ObservableObject {
                     Text("I heard", style: .heading)
                     Text(question, style: .body)
                     Text("Send this question with one captured moment?", style: .body, color: .secondary)
-                    Button(label: "Send", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Send", style: .primary, onClick: {
                         Task { @MainActor [service] in service.sendFaithLensSpokenQuestion() }
                     })
-                    Button(label: "Try again", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Try again", style: .primary, onClick: {
                         Task { @MainActor [service] in service.startFaithLensListeningFromGlasses() }
                     })
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in service.returnToGlassesHome() }
                     })
                 }.padding(24).background(.card)
@@ -1047,10 +1119,10 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("I didn't hear a question", style: .heading)
                     Text("Keep your glasses connected and speak a little closer to the microphone, then try again.", style: .body, color: .secondary)
-                    Button(label: "Try again", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Try again", style: .primary, onClick: {
                         Task { @MainActor [service] in service.startFaithLensListeningFromGlasses() }
                     })
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in service.returnToGlassesHome() }
                     })
                 }.padding(24).background(.card)
@@ -1078,10 +1150,10 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("Camera unavailable", style: .heading)
                     Text("Keep your glasses open, worn, and connected in Meta AI, then try again.", style: .body, color: .secondary)
-                    Button(label: "Try again", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Try again", style: .primary, onClick: {
                         Task { @MainActor [service] in service.startFaithLensCamera() }
                     })
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in service.returnToGlassesHome() }
                     })
                 }.padding(24).background(.card)
@@ -1101,7 +1173,7 @@ final class WearablesService: ObservableObject {
                     Text(result.scripture.reference, style: .body, color: .secondary)
                     Text(result.scripture.content, style: .body)
                     if let prayer = result.prayer { Text("Prayer: \(prayer)", style: .body, color: .secondary) }
-                    Button(label: "Done", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Done", style: .primary, onClick: {
                         Task { @MainActor [service] in service.returnToGlassesHome() }
                     })
                 }.padding(24).background(.card)
@@ -1111,26 +1183,41 @@ final class WearablesService: ObservableObject {
 
     private func sendStoryEntryCard() async {
         guard let display else { return }
+        // This is intentionally the same clean surface as the first Story
+        // prompt. A retry must never reopen the microphone from a review card.
+        hasStartedStoryCapture = false
         let service = self
         do {
             try await display.send(
                 FlexBox(direction: .column, spacing: 12) {
                     Text("Bible Story", style: .heading)
                     Text("Ask for a person, a moment, or what you need today. Tevari creates one short scene, then grounds it in Scripture.", style: .body, color: .secondary)
-                    Button(label: "Speak a prompt", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Speak a prompt", style: .primary, onClick: {
                         Task { @MainActor [service] in service.startStoryListening() }
                     })
-                    Button(label: "Story for courage", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Story for courage", style: .primary, onClick: {
                         Task { @MainActor [service] in
                             service.startStory(prompt: "Tell me a Bible story about courage when I feel afraid.")
                         }
                     })
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in service.returnToGlassesHome() }
                     })
                 }.padding(24).background(.card)
             )
         } catch { errorMessage = "Could not show Story: \(error.localizedDescription)" }
+    }
+
+    private func sendStoryListeningStartingCard() async {
+        guard let display else { return }
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("● Preparing microphone", style: .heading)
+                    Text("Resetting your glasses microphone for the next prompt…", style: .body, color: .secondary)
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not prepare Story microphone: \(error.localizedDescription)" }
     }
 
     private func sendStoryListeningCard() async {
@@ -1144,10 +1231,10 @@ final class WearablesService: ObservableObject {
                     if !storyPrompt.isEmpty {
                         Text(storyPrompt, style: .body)
                     }
-                    Button(label: "I'm done speaking", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "I'm done speaking", style: .primary, onClick: {
                         Task { @MainActor [service] in service.finishStoryListening() }
                     })
-                    Button(label: "Cancel", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Cancel", style: .primary, onClick: {
                         Task { @MainActor [service] in
                             service.stopFaithLensListening()
                             await service.sendStoryEntryCard()
@@ -1172,6 +1259,17 @@ final class WearablesService: ObservableObject {
         }
     }
 
+    private func scheduleFaithLensTranscriptUpdate() {
+        faithLensTranscriptUpdateTask?.cancel()
+        faithLensTranscriptUpdateTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard let self, !Task.isCancelled,
+                  self.speechCaptureDestination == .faithLens,
+                  self.audioEngine.isRunning else { return }
+            await self.sendFaithLensListeningCard()
+        }
+    }
+
     private func sendStoryPromptReviewCard(_ prompt: String) async {
         guard let display else { return }
         let service = self
@@ -1181,13 +1279,13 @@ final class WearablesService: ObservableObject {
                     Text("I heard", style: .heading)
                     Text(prompt, style: .body)
                     Text("Send this to Tevari?", style: .body, color: .secondary)
-                    Button(label: "Send", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Send", style: .primary, onClick: {
                         Task { @MainActor [service] in service.startStory(prompt: prompt) }
                     })
-                    Button(label: "Try again", style: .primary, iconName: .checkmark, onClick: {
-                        Task { @MainActor [service] in service.startStoryListening() }
+                    Button(label: "Try again", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.openStory() }
                     })
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in await service.sendStoryEntryCard() }
                     })
                 }.padding(24).background(.card)
@@ -1228,7 +1326,7 @@ final class WearablesService: ObservableObject {
                     Text("Now telling", style: .heading)
                     Text(scene.title, style: .body, color: .secondary)
                     Text("The narration is playing through your selected glasses audio.", style: .body)
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in
                             service.stopStoryNarration()
                             await service.sendStoryMoreCard(scene)
@@ -1245,15 +1343,19 @@ final class WearablesService: ObservableObject {
         do {
             try await display.send(
                 FlexBox(direction: .column, spacing: 12) {
-                    Text(scene.title, style: .heading)
-                    Text(scene.guide, style: .body)
+                    Text("Your story", style: .heading)
+                    Text(String(scene.guide.prefix(220)), style: .body)
+                    Text(scene.title, style: .body, color: .secondary)
                     Text("Scripture · \(scene.scripture.reference)", style: .body, color: .secondary)
-                    Button(label: "Continue", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Continue", style: .primary, onClick: {
                         Task { @MainActor [service] in
-                            service.startStory(prompt: "Continue the Bible story from \(scene.scripture.reference) as the next short scene.")
+                            service.startStory(
+                                prompt: "Continue this Bible story.",
+                                continuationPassageID: scene.scripture.id
+                            )
                         }
                     })
-                    Button(label: "More", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "More", style: .primary, onClick: {
                         Task { @MainActor [service] in await service.sendStoryMoreCard(scene) }
                     })
                 }.padding(24).background(.card)
@@ -1269,16 +1371,16 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("More", style: .heading)
                     Text(scene.title, style: .body, color: .secondary)
-                    Button(label: "Hear narration", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Hear narration", style: .primary, onClick: {
                         Task { @MainActor [service] in service.playStoryNarration() }
                     })
-                    Button(label: "Read Scripture", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Read Scripture", style: .primary, onClick: {
                         Task { @MainActor [service] in await service.sendStoryScriptureCard(scene) }
                     })
-                    Button(label: "Pray from this", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Pray from this", style: .primary, onClick: {
                         Task { @MainActor [service] in service.openPrayerExperience() }
                     })
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in
                             service.stopStoryNarration()
                             service.storyScene = nil
@@ -1300,7 +1402,7 @@ final class WearablesService: ObservableObject {
                     Text(scene.scripture.reference, style: .body, color: .secondary)
                     Text(scene.scripture.content, style: .body)
                     Text("NIV11 · YouVersion", style: .body, color: .secondary)
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in await service.sendStoryMoreCard(scene) }
                     })
                 }.padding(24).background(.card)
@@ -1316,14 +1418,14 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("Prayer", style: .heading)
                     Text("Begin when you are ready. Tevari will only use your voice after you explicitly start it.", style: .body, color: .secondary)
-                    Button(label: "Start prayer", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Start prayer", style: .primary, onClick: {
                         Task { @MainActor [service] in service.startPrayerListening() }
                     })
                     Text("Tevari listens only while this session is active. Stop at any time.", style: .body, color: .secondary)
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in service.returnToGlassesHome() }
                     })
-                    Button(label: "Done", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Done", style: .primary, onClick: {
                         Task { @MainActor [service] in service.stopGlassesExperience() }
                     })
                 }
@@ -1359,10 +1461,10 @@ final class WearablesService: ObservableObject {
                     if prompt == nil, !prayerTranscript.isEmpty {
                         Text(prayerTranscript, style: .body, color: .secondary)
                     }
-                    Button(label: "Finish prayer", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Finish prayer", style: .primary, onClick: {
                         Task { @MainActor [service] in await service.completePrayer() }
                     })
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in
                             service.stopPrayerListening()
                             await service.sendPrayerEntryCard()
@@ -1389,7 +1491,7 @@ final class WearablesService: ObservableObject {
                 FlexBox(direction: .column, spacing: 12) {
                     Text("Prayer", style: .heading)
                     Text("Tevari could not prepare Scripture and a prayer prompt right now.", style: .body, color: .secondary)
-                    Button(label: "Back", style: .primary, iconName: .checkmark, onClick: {
+                    Button(label: "Back", style: .primary, onClick: {
                         Task { @MainActor [service] in await service.sendPrayerEntryCard() }
                     })
                 }
@@ -1420,58 +1522,7 @@ final class WearablesService: ObservableObject {
     }
 
     private func beginSpeechRecognition() async throws {
-        guard let speechRecognizer, speechRecognizer.isAvailable else {
-            throw NSError(domain: "Tevari", code: 1, userInfo: [NSLocalizedDescriptionKey: "Speech Recognition is unavailable right now."])
-        }
-        stopPrayerListening()
-        prayerTranscript = ""
-        let audioSession = AVAudioSession.sharedInstance()
-        // Meta's HFP guidance: use the bidirectional category, select the
-        // glasses HFP input, then wait for Bluetooth routing to settle.
-        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
-        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-        guard let hfpInput = audioSession.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) else {
-            throw NSError(domain: "Tevari", code: 2, userInfo: [NSLocalizedDescriptionKey: "Glasses microphone is unavailable. Reconnect your glasses in Meta AI and try again."])
-        }
-        try audioSession.setPreferredInput(hfpInput)
-        prayerStatus = "Connecting glasses microphone"
-        try await Task.sleep(for: .seconds(2))
-        guard audioSession.currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) else {
-            try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-            throw NSError(domain: "Tevari", code: 3, userInfo: [NSLocalizedDescriptionKey: "Tevari could not route audio to your glasses microphone."])
-        }
-
-        // AVAudioEngine captures the selected route format when constructed.
-        audioEngine = AVAudioEngine()
-
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        recognitionRequest = request
-        let input = audioEngine.inputNode
-        input.removeTap(onBus: 0)
-        // The input scope is the microphone's hardware format (16 kHz for
-        // glasses HFP), unlike the engine output scope which can be 48 kHz.
-        input.installTap(onBus: 0, bufferSize: 1_024, format: input.inputFormat(forBus: 0)) { [weak self] buffer, _ in
-            self?.recognitionRequest?.append(buffer)
-        }
-        audioEngine.prepare()
-        try audioEngine.start()
-        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
-            Task { @MainActor in
-                guard let self else { return }
-                if let text = result?.bestTranscription.formattedString, !text.isEmpty {
-                    self.prayerTranscript = text
-                    if !self.isShowingPrayerPrompt {
-                        await self.sendListeningCard()
-                    }
-                }
-                if let error, !self.isFinishingCapture {
-                    self.prayerStatus = "Listening stopped"
-                    self.errorMessage = "Tevari stopped listening: \(error.localizedDescription)"
-                    self.stopPrayerListening()
-                }
-            }
-        }
+        try await beginGlassesSpeechRecognition(destination: .prayer)
     }
 
     /// Keeps listening while a person prays. The first prompt is delayed long
@@ -1503,7 +1554,7 @@ final class WearablesService: ObservableObject {
         do {
             let response = try await TevariAPI.prayerContinuation(
                 history: [.spoken(transcript)],
-                tradition: "general"
+                tradition: tradition.rawValue
             )
             guard audioEngine.isRunning, !isFinishingCapture else { return }
             prayerStatus = "Listening with prompt"
@@ -1540,7 +1591,7 @@ final class WearablesService: ObservableObject {
         do {
             let response = try await TevariAPI.prayerContinuation(
                 history: [.spoken(transcript)],
-                tradition: "general"
+                tradition: tradition.rawValue
             )
             prayerStatus = "Prompt ready"
             isShowingPrayerPrompt = true

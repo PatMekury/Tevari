@@ -140,11 +140,14 @@ enum TevariAPI {
 
     static func storyScene(
         prompt: String,
-        tradition: String = "general"
+        tradition: String = "general",
+        continuationPassageID: String? = nil
     ) async throws -> TevariStoryScene {
-        try await request(
+        var body: [String: Any] = ["prompt": prompt, "tradition": tradition]
+        if let continuationPassageID { body["continuationPassageID"] = continuationPassageID }
+        return try await request(
             path: "storyScene",
-            body: ["prompt": prompt, "tradition": tradition]
+            body: body
         )
     }
 
