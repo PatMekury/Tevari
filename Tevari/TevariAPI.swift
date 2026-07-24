@@ -78,6 +78,15 @@ struct TevariStoryScene: Decodable, Sendable {
     let model: String?
 }
 
+struct TevariParallel: Decodable, Sendable {
+    let moment: String
+    let scene: String
+    let narration: String
+    let scripture: TevariPrayerPrompt.Scripture
+    let supporting: [TevariPrayerPrompt.Scripture]
+    let model: String?
+}
+
 struct TevariScripturePassage: Decodable, Sendable {
     struct Passage: Decodable, Sendable {
         let id: String
@@ -149,6 +158,16 @@ enum TevariAPI {
             path: "storyScene",
             body: body
         )
+    }
+
+    static func parallel(
+        prompt: String,
+        imageData: Data? = nil,
+        tradition: String = "general"
+    ) async throws -> TevariParallel {
+        var body: [String: Any] = ["prompt": prompt, "tradition": tradition]
+        if let imageData { body["imageBase64"] = imageData.base64EncodedString() }
+        return try await request(path: "parallel", body: body)
     }
 
     static func storyNarration(_ narration: String) async throws -> Data {

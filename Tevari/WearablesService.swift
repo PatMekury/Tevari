@@ -45,6 +45,8 @@ final class WearablesService: ObservableObject {
     @Published private(set) var faithLensQuestion = ""
     @Published private(set) var storyStatus = "Not started"
     @Published private(set) var storyScene: TevariStoryScene?
+    @Published private(set) var parallelStatus = "Not started"
+    @Published private(set) var parallel: TevariParallel?
     @Published private(set) var tradition: Tradition = .general
     @Published var errorMessage: String?
 
@@ -63,7 +65,10 @@ final class WearablesService: ObservableObject {
     private var isRequestingFaithLensCamera = false
     private var hasPresentedFaithLensCameraControls = false
     private var pendingFaithLensQuestion: String?
+    private var isParallelCameraMode = false
+    private var pendingParallelCapture = false
     private var storyPrompt = ""
+    private var parallelPrompt = ""
     private var hasStartedStoryCapture = false
     private var storyTranscriptUpdateTask: Task<Void, Never>?
     private var faithLensTranscriptUpdateTask: Task<Void, Never>?
@@ -84,7 +89,7 @@ final class WearablesService: ObservableObject {
     private var isRequestingLivePrompt = false
     private var isShowingPrayerPrompt = false
     private var lastPromptWordCount = 0
-    private enum SpeechCaptureDestination { case none, prayer, faithLens, story }
+    private enum SpeechCaptureDestination { case none, prayer, faithLens, story, parallel }
     private var speechCaptureDestination: SpeechCaptureDestination = .none
     // DAT accepts one display update at a time. Speech recognition, a live
     // prompt, and a button action can otherwise race and cause the SDK to
@@ -237,6 +242,88 @@ final class WearablesService: ObservableObject {
         Task { await sendStoryEntryCard() }
     }
 
+    func openParallel() {
+        stopFaithLensCamera()
+        stopPrayerListening()
+        stopStoryNarration()
+        glassesRouteTitle = "Parallel"
+        parallelStatus = "Ready"
+        parallelPrompt = ""
+        parallel = nil
+        Task { await sendParallelEntryCard() }
+    }
+
+    func startParallelFromView() {
+        isParallelCameraMode = true
+        pendingParallelCapture = false
+        startFaithLensCamera()
+    }
+
+    func captureParallelView() {
+        guard let cameraStream else { return }
+        pendingParallelCapture = true
+        if !cameraStream.capturePhoto(format: .jpeg) {
+            pendingParallelCapture = false
+            errorMessage = "Parallel could not capture this moment."
+        }
+    }
+
+    func startParallelListening() {
+        guard !audioEngine.isRunning else { return }
+        Task {
+            errorMessage = nil
+            parallelPrompt = ""
+            parallelStatus = "Preparing microphone"
+            guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
+                parallelStatus = "Microphone permission needed"
+                await sendParallelEntryCard()
+                return
+            }
+            do {
+                try await beginGlassesSpeechRecognition(destination: .parallel)
+                parallelStatus = "Listening"
+                await sendParallelListeningCard()
+            } catch {
+                parallelStatus = "Could not listen"
+                errorMessage = error.localizedDescription
+                await sendParallelEntryCard()
+            }
+        }
+    }
+
+    func finishParallelListening() {
+        stopFaithLensListening()
+        let prompt = parallelPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else {
+            parallelStatus = "No moment heard"
+            Task { await sendParallelEntryCard() }
+            return
+        }
+        Task {
+            await restoreGlassesMediaRouteAfterStoryCapture()
+            await sendParallelReviewCard(prompt)
+        }
+    }
+
+    func createParallel(prompt: String, imageData: Data? = nil) {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        parallelStatus = "Finding your Parallel"
+        Task { await sendParallelPreparingCard() }
+        Task {
+            do {
+                let result = try await TevariAPI.parallel(prompt: trimmed, imageData: imageData, tradition: tradition.rawValue)
+                parallel = result
+                parallelStatus = "Ready"
+                await sendParallelCard(result)
+            } catch {
+                parallelStatus = "Unavailable"
+                errorMessage = error.localizedDescription
+                await sendParallelEntryCard()
+            }
+        }
+    }
+
     func selectTradition(_ selection: Tradition) {
         tradition = selection
         UserDefaults.standard.set(selection.rawValue, forKey: Self.traditionDefaultsKey)
@@ -378,7 +465,8 @@ final class WearablesService: ObservableObject {
                     self.faithLensStatus = state == .streaming ? "Camera live — ask a question" : String(describing: state).capitalized
                     if state == .streaming, !self.hasPresentedFaithLensCameraControls {
                         self.hasPresentedFaithLensCameraControls = true
-                        await self.sendFaithLensCameraReadyCard()
+                        if self.isParallelCameraMode { await self.sendParallelCameraReadyCard() }
+                        else { await self.sendFaithLensCameraReadyCard() }
                     }
                 }
             }
@@ -575,6 +663,8 @@ final class WearablesService: ObservableObject {
 
     func stopFaithLensCamera() {
         stopFaithLensListening()
+        isParallelCameraMode = false
+        pendingParallelCapture = false
         cameraStream?.stop()
         cameraStateToken = nil
         cameraFrameToken = nil
@@ -588,6 +678,13 @@ final class WearablesService: ObservableObject {
     }
 
     private func receivedFaithLensCapture(_ data: Data) async {
+        if pendingParallelCapture {
+            pendingParallelCapture = false
+            isParallelCameraMode = false
+            stopFaithLensCamera()
+            createParallel(prompt: "Find a thoughtful biblical parallel for the real-world moment I am seeing.", imageData: data)
+            return
+        }
         guard let question = pendingFaithLensQuestion else { return }
         pendingFaithLensQuestion = nil
         faithLensStatus = "Reflecting on this moment"
@@ -654,6 +751,9 @@ final class WearablesService: ObservableObject {
                     case .story:
                         self.storyPrompt = text
                         self.scheduleStoryTranscriptUpdate()
+                    case .parallel:
+                        self.parallelPrompt = text
+                        self.scheduleParallelTranscriptUpdate()
                     case .none:
                         break
                     }
@@ -913,6 +1013,9 @@ final class WearablesService: ObservableObject {
                     })
                     Button(label: "Story", style: .primary, onClick: {
                         Task { @MainActor [service] in service.openStory() }
+                    })
+                    Button(label: "Parallel", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.openParallel() }
                     })
                     Button(label: "Done", style: .primary, onClick: {
                         Task { @MainActor [service] in service.stopGlassesExperience() }
@@ -1206,6 +1309,172 @@ final class WearablesService: ObservableObject {
                 }.padding(24).background(.card)
             )
         } catch { errorMessage = "Could not show Story: \(error.localizedDescription)" }
+    }
+
+    private func sendParallelEntryCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Parallel", style: .heading)
+                    Text("Bring one real moment into conversation with a Bible scene.", style: .body, color: .secondary)
+                    Button(label: "Speak it", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.startParallelListening() }
+                    })
+                    Button(label: "Use what I'm seeing", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.startParallelFromView() }
+                    })
+                    Button(label: "Back", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Parallel: \(error.localizedDescription)" }
+    }
+
+    private func sendParallelCameraReadyCard() async {
+        guard let display else { return }
+        let service = self
+        do { try await display.send(FlexBox(direction: .column, spacing: 12) {
+            Text("Parallel", style: .heading)
+            Text("Look at the moment before you. Tevari captures one photo only when you choose.", style: .body, color: .secondary)
+            Button(label: "Find a Parallel", style: .primary, onClick: {
+                Task { @MainActor [service] in service.captureParallelView() }
+            })
+            Button(label: "Back", style: .primary, onClick: {
+                Task { @MainActor [service] in service.stopFaithLensCamera(); service.openParallel() }
+            })
+        }.padding(24).background(.card)) }
+        catch { errorMessage = "Could not show Parallel camera: \(error.localizedDescription)" }
+    }
+
+    private func sendParallelListeningCard() async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("● Listening", style: .heading)
+                    Text("What is happening in your moment?", style: .body, color: .secondary)
+                    if !parallelPrompt.isEmpty { Text(parallelPrompt, style: .body) }
+                    Button(label: "I'm done speaking", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.finishParallelListening() }
+                    })
+                    Button(label: "Cancel", style: .primary, onClick: {
+                        Task { @MainActor [service] in
+                            service.stopFaithLensListening()
+                            await service.sendParallelEntryCard()
+                        }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Parallel listening: \(error.localizedDescription)" }
+    }
+
+    private func scheduleParallelTranscriptUpdate() {
+        storyTranscriptUpdateTask?.cancel()
+        storyTranscriptUpdateTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard let self, !Task.isCancelled, self.speechCaptureDestination == .parallel, self.audioEngine.isRunning else { return }
+            await self.sendParallelListeningCard()
+        }
+    }
+
+    private func sendParallelReviewCard(_ prompt: String) async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("I heard", style: .heading)
+                    Text(prompt, style: .body)
+                    Button(label: "Find my Parallel", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.createParallel(prompt: prompt) }
+                    })
+                    Button(label: "Try again", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.openParallel() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not review Parallel: \(error.localizedDescription)" }
+    }
+
+    private func sendParallelPreparingCard() async {
+        guard let display else { return }
+        do { try await display.send(FlexBox(direction: .column, spacing: 12) {
+            Text("Parallel", style: .heading)
+            Text("Finding a biblical scene for this moment…", style: .body, color: .secondary)
+        }.padding(24).background(.card)) }
+        catch { errorMessage = "Could not prepare Parallel: \(error.localizedDescription)" }
+    }
+
+    private func sendParallelCard(_ result: TevariParallel) async {
+        guard let display else { return }
+        let service = self
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Parallel", style: .heading)
+                    Text("Similar in Scripture", style: .body, color: .secondary)
+                    Text(result.scripture.reference, style: .body, color: .secondary)
+                    Text(result.scripture.content, style: .body)
+                    for passage in result.supporting {
+                        Text(passage.reference, style: .body, color: .secondary)
+                        Text(passage.content, style: .body)
+                    }
+                    Button(label: "Done", style: .primary, onClick: {
+                        Task { @MainActor [service] in service.returnToGlassesHome() }
+                    })
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not show Parallel: \(error.localizedDescription)" }
+    }
+
+    private func playParallelNarration(_ result: TevariParallel) {
+        Task {
+            do {
+                let data = try await TevariAPI.storyNarration(result.narration)
+                try await routeStoryNarrationToGlasses()
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent("tevari-parallel-\(UUID().uuidString).wav")
+                try data.write(to: url, options: .atomic)
+                storyAudioURL = url
+                storyAudioPlayer = try AVAudioPlayer(contentsOf: url)
+                storyAudioPlayer?.play()
+                await sendParallelNarratingCard(result)
+            } catch { errorMessage = error.localizedDescription; await sendParallelCard(result) }
+        }
+    }
+
+    private func sendParallelNarratingCard(_ result: TevariParallel) async {
+        guard let display else { return }
+        let service = self
+        do { try await display.send(FlexBox(direction: .column, spacing: 12) {
+            Text("Now telling", style: .heading)
+            Text(result.scene, style: .body)
+            Button(label: "Read passages", style: .primary, onClick: {
+                Task { @MainActor [service] in service.stopStoryNarration(); await service.sendParallelPassagesCard(result) }
+            })
+        }.padding(24).background(.card)) }
+        catch { errorMessage = "Could not show Parallel narration: \(error.localizedDescription)" }
+    }
+
+    private func sendParallelPassagesCard(_ result: TevariParallel) async {
+        guard let display else { return }
+        let service = self
+        do { try await display.send(FlexBox(direction: .column, spacing: 12) {
+            Text("Parallel passages", style: .heading)
+            Text(result.scripture.reference, style: .body, color: .secondary)
+            Text(result.scripture.content, style: .body)
+            for passage in result.supporting {
+                Text(passage.reference, style: .body, color: .secondary)
+                Text(passage.content, style: .body)
+            }
+            Button(label: "Done", style: .primary, onClick: {
+                Task { @MainActor [service] in service.returnToGlassesHome() }
+            })
+        }.padding(24).background(.card)) }
+        catch { errorMessage = "Could not show Parallel passages: \(error.localizedDescription)" }
     }
 
     private func sendStoryListeningStartingCard() async {
