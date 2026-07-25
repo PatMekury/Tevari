@@ -52,7 +52,7 @@
 	</dict>
 	<key>NSBluetoothAlwaysUsageDescription</key><string>Tevari uses Bluetooth to connect to your Meta glasses when you choose to connect them.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Tevari uses your Meta glasses camera only when you start Faith Lens and capture a moment you choose to ask about.</string>
+	<string>Tevari uses your iPhone or Meta glasses camera only when you start Faith Lens and capture a moment you choose to ask about.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Tevari uses the microphone only after you start a spoken prayer or Faith Lens question, so it can transcribe what you choose to share.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
@@ -62,6 +62,20 @@
 	<key>NSBonjourServices</key>
 	<array><string>_bonjour._tcp</string></array>
 	<key>UIBackgroundModes</key><array><string>bluetooth-central</string><string>bluetooth-peripheral</string><string>external-accessory</string><string>processing</string></array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
 	<key>UISupportedExternalAccessoryProtocols</key><array><string>com.meta.ar.wearable</string></array>
 	<key>UILaunchScreen</key>
 	<dict/>

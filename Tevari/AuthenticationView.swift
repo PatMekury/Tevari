@@ -22,7 +22,7 @@ struct AuthenticationView: View {
         .background(Color.tevariMidnight.ignoresSafeArea())
         .preferredColorScheme(.dark)
         .fullScreenCover(isPresented: Binding(get: { auth.user != nil }, set: { _ in })) {
-            DeviceSetupFlowView(auth: auth)
+            TevariHomeShell(auth: auth)
         }
     }
 
