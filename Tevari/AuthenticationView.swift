@@ -161,9 +161,11 @@ private struct AuthenticationCanvas<Content: View>: View {
 private struct BrandLockup: View {
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(Color.tevariGold)
+            Image("TevariMark")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 20, height: 20)
+                .accessibilityHidden(true)
             Text("TEVARI")
                 .font(.system(size: 14, weight: .medium, design: .default))
                 .tracking(3)

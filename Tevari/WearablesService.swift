@@ -65,6 +65,12 @@ final class WearablesService: ObservableObject {
     private var isRequestingFaithLensCamera = false
     private var hasPresentedFaithLensCameraControls = false
     private var pendingFaithLensQuestion: String?
+    // Asking a spoken question needs the glasses HFP microphone.  Hold one
+    // user-triggered still frame in memory, then release the camera stream
+    // before opening HFP; some glasses cannot expose both resources at once.
+    private var pendingFaithLensQuestionImage: Data?
+    private var isCapturingFaithLensQuestionImage = false
+    private var resumesFaithLensQuestionAfterCameraStart = false
     private var isParallelCameraMode = false
     private var pendingParallelCapture = false
     private var storyPrompt = ""
@@ -186,6 +192,21 @@ final class WearablesService: ObservableObject {
         }
     }
 
+    /// Makes the paired glasses available in Apple's audio route picker before
+    /// a spoken experience begins. The wearer still chooses the route in the
+    /// system control; selecting an HFP output also selects its microphone.
+    func prepareGlassesAudioRoute() {
+        Task {
+            do {
+                let audioSession = AVAudioSession.sharedInstance()
+                try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
+                try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+            } catch {
+                errorMessage = "Tevari could not prepare the glasses audio route: \(error.localizedDescription)"
+            }
+        }
+    }
+
     func stopGlassesExperience() {
         stopPrayerListening()
         stopFaithLensCamera()
@@ -274,7 +295,7 @@ final class WearablesService: ObservableObject {
             errorMessage = nil
             parallelPrompt = ""
             parallelStatus = "Preparing microphone"
-            guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
+            guard await requestVoiceAuthorizations() else {
                 parallelStatus = "Microphone permission needed"
                 await sendParallelEntryCard()
                 return
@@ -337,7 +358,7 @@ final class WearablesService: ObservableObject {
             errorMessage = nil
             storyPrompt = ""
             storyStatus = "Preparing glasses microphone"
-            guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
+            guard await requestVoiceAuthorizations() else {
                 storyStatus = "Microphone permission needed"
                 errorMessage = "Allow Microphone and Speech Recognition for Tevari in iPhone Settings, then try your Story prompt again."
                 await sendStoryEntryCard()
@@ -466,7 +487,13 @@ final class WearablesService: ObservableObject {
                     if state == .streaming, !self.hasPresentedFaithLensCameraControls {
                         self.hasPresentedFaithLensCameraControls = true
                         if self.isParallelCameraMode { await self.sendParallelCameraReadyCard() }
-                        else { await self.sendFaithLensCameraReadyCard() }
+                        else {
+                            await self.sendFaithLensCameraReadyCard()
+                            if self.resumesFaithLensQuestionAfterCameraStart {
+                                self.resumesFaithLensQuestionAfterCameraStart = false
+                                self.startFaithLensListeningFromGlasses()
+                            }
+                        }
                     }
                 }
             }
@@ -502,7 +529,6 @@ final class WearablesService: ObservableObject {
             errorMessage = "Faith Lens could not capture a frame. Keep the glasses open and try again."
             return
         }
-        Task { await sendFaithLensReflectingCard() }
     }
 
     /// Speaks the short, generated reflection only after the user asks to hear it.
@@ -536,7 +562,7 @@ final class WearablesService: ObservableObject {
             errorMessage = nil
             faithLensQuestion = ""
             speechCaptureDestination = .faithLens
-            guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
+            guard await requestVoiceAuthorizations() else {
                 faithLensStatus = "Microphone permission needed"
                 errorMessage = "Allow Microphone and Speech Recognition for Tevari in iPhone Settings, then try Faith Lens again."
                 return
@@ -556,11 +582,38 @@ final class WearablesService: ObservableObject {
     /// for this active request and never stores it.
     func startFaithLensListeningFromGlasses() {
         guard !audioEngine.isRunning else { return }
+        // Capture the real-world moment while the camera is live, then yield
+        // that hardware resource before claiming the glasses microphone.
+        // This is the route Meta glasses reliably expose without a call UI.
+        guard let cameraStream else {
+            resumesFaithLensQuestionAfterCameraStart = true
+            startFaithLensCamera()
+            return
+        }
+        guard !isCapturingFaithLensQuestionImage else { return }
+        errorMessage = nil
+        isCapturingFaithLensQuestionImage = true
+        faithLensStatus = "Capturing moment for your question"
+        Task { await sendFaithLensQuestionCaptureCard() }
+        guard cameraStream.capturePhoto(format: .jpeg) else {
+            isCapturingFaithLensQuestionImage = false
+            faithLensStatus = "Could not capture"
+            errorMessage = "Faith Lens could not capture this moment. Keep the glasses open and try again."
+            Task { await sendFaithLensCameraReadyCard() }
+            return
+        }
+    }
+
+    /// Opens HFP only after a question frame has been captured and the camera
+    /// stream has been released.  Keeping this separate makes retries follow
+    /// the same hardware lifecycle as the first spoken question.
+    private func beginFaithLensListeningFromGlasses() {
+        guard !audioEngine.isRunning else { return }
         Task {
             errorMessage = nil
             faithLensQuestion = ""
             faithLensStatus = "Preparing glasses microphone"
-            guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
+            guard await requestVoiceAuthorizations() else {
                 faithLensStatus = "Microphone permission needed"
                 errorMessage = "Allow Microphone and Speech Recognition for Tevari in iPhone Settings, then try your Faith Lens question again."
                 await sendFaithLensCameraReadyCard()
@@ -594,7 +647,17 @@ final class WearablesService: ObservableObject {
     }
 
     func sendFaithLensSpokenQuestion() {
-        captureFaithLens(question: faithLensQuestion)
+        let question = faithLensQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else { return }
+        guard let image = pendingFaithLensQuestionImage else {
+            // This is only a recovery path for an interrupted capture. Start
+            // the controlled capture-and-listen sequence again rather than
+            // attempting HFP while the camera is still active.
+            startFaithLensListeningFromGlasses()
+            return
+        }
+        pendingFaithLensQuestionImage = nil
+        Task { await reflectOnFaithLensCapture(image, question: question) }
     }
 
     func stopFaithLensListening() {
@@ -611,6 +674,14 @@ final class WearablesService: ObservableObject {
         faithLensTranscriptUpdateTask?.cancel()
         speechCaptureDestination = .none
         if faithLensStatus == "Listening for your question" { faithLensStatus = "Question ready" }
+    }
+
+    private func resumeFaithLensCameraAfterQuestionCancellation() {
+        stopFaithLensListening()
+        pendingFaithLensQuestionImage = nil
+        faithLensQuestion = ""
+        resumesFaithLensQuestionAfterCameraStart = false
+        startFaithLensCamera()
     }
 
     private func stopStoryNarration() {
@@ -665,19 +736,23 @@ final class WearablesService: ObservableObject {
         stopFaithLensListening()
         isParallelCameraMode = false
         pendingParallelCapture = false
-        cameraStream?.stop()
-        cameraStateToken = nil
-        cameraFrameToken = nil
-        cameraPhotoToken = nil
-        cameraErrorToken = nil
-        cameraStream = nil
-        hasPresentedFaithLensCameraControls = false
+        releaseFaithLensCameraStream()
         pendingFaithLensQuestion = nil
+        pendingFaithLensQuestionImage = nil
+        isCapturingFaithLensQuestionImage = false
+        resumesFaithLensQuestionAfterCameraStart = false
         latestFaithLensFrame = nil
         if faithLensStatus != "Not started" { faithLensStatus = "Stopped" }
     }
 
     private func receivedFaithLensCapture(_ data: Data) async {
+        if isCapturingFaithLensQuestionImage {
+            isCapturingFaithLensQuestionImage = false
+            pendingFaithLensQuestionImage = data
+            releaseFaithLensCameraStream()
+            beginFaithLensListeningFromGlasses()
+            return
+        }
         if pendingParallelCapture {
             pendingParallelCapture = false
             isParallelCameraMode = false
@@ -687,7 +762,12 @@ final class WearablesService: ObservableObject {
         }
         guard let question = pendingFaithLensQuestion else { return }
         pendingFaithLensQuestion = nil
+        await reflectOnFaithLensCapture(data, question: question)
+    }
+
+    private func reflectOnFaithLensCapture(_ data: Data, question: String) async {
         faithLensStatus = "Reflecting on this moment"
+        await sendFaithLensReflectingCard()
         do {
             let response = try await TevariAPI.faithLens(imageData: data, question: question, tradition: tradition.rawValue)
             faithLensResponse = response
@@ -700,6 +780,17 @@ final class WearablesService: ObservableObject {
         }
     }
 
+    private func releaseFaithLensCameraStream() {
+        cameraStream?.stop()
+        cameraStateToken = nil
+        cameraFrameToken = nil
+        cameraPhotoToken = nil
+        cameraErrorToken = nil
+        cameraStream = nil
+        hasPresentedFaithLensCameraControls = false
+        latestFaithLensFrame = nil
+    }
+
     /// The one and only glasses microphone lifecycle. Prayer is the working
     /// reference implementation, so Story and Faith Lens use this exact route
     /// setup—not a parallel "call"-style session—on first prompt and retry.
@@ -707,20 +798,28 @@ final class WearablesService: ObservableObject {
         guard let speechRecognizer, speechRecognizer.isAvailable else {
             throw NSError(domain: "Tevari", code: 1, userInfo: [NSLocalizedDescriptionKey: "Speech Recognition is unavailable right now."])
         }
-        // This is deliberately the same reset Prayer has always used.
+        // This is the known-good Prayer route lifecycle.  Do not tear down
+        // unrelated Story/Faith Lens sessions here: repeated deactivation can
+        // make iOS drop the glasses HFP endpoint before it is selected.
         stopPrayerListening()
         speechCaptureDestination = destination
         if destination == .prayer { prayerTranscript = "" }
         let audioSession = AVAudioSession.sharedInstance()
-        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
+        // Listening is input-only. Using a duplex/voice-chat-style category
+        // here can make iOS surface a call treatment over the glasses. A
+        // record-only HFP session keeps the glasses microphone while Tevari's
+        // own Listening card remains the only listening UI.
+        try audioSession.setCategory(.record, mode: .measurement, options: [.allowBluetoothHFP])
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         guard let hfpInput = audioSession.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) else {
+            logGlassesMicrophoneRoute(audioSession)
             throw NSError(domain: "Tevari", code: 2, userInfo: [NSLocalizedDescriptionKey: "Glasses microphone is unavailable. Reconnect your glasses in Meta AI and try again."])
         }
         try audioSession.setPreferredInput(hfpInput)
         if destination == .prayer { prayerStatus = "Connecting glasses microphone" }
         try await Task.sleep(for: .seconds(2))
         guard audioSession.currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) else {
+            logGlassesMicrophoneRoute(audioSession)
             try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
             throw NSError(domain: "Tevari", code: 3, userInfo: [NSLocalizedDescriptionKey: "Tevari could not route audio to your glasses microphone."])
         }
@@ -769,6 +868,12 @@ final class WearablesService: ObservableObject {
         }
     }
 
+    private func logGlassesMicrophoneRoute(_ audioSession: AVAudioSession) {
+        let currentInputs = audioSession.currentRoute.inputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ", ")
+        let availableInputs = (audioSession.availableInputs ?? []).map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ", ")
+        print("Tevari glasses microphone route unavailable. Current inputs=[\(currentInputs)] Available inputs=[\(availableInputs)]")
+    }
+
     /// Called only from the explicit Start prayer action on the glasses.
     func startPrayerListening() {
         guard !audioEngine.isRunning else { return }
@@ -780,7 +885,7 @@ final class WearablesService: ObservableObject {
             isShowingPrayerPrompt = false
             lastPromptWordCount = 0
             prayerStatus = "Requesting microphone access"
-            guard await requestSpeechAuthorization(), await requestMicrophoneAuthorization() else {
+            guard await requestVoiceAuthorizations() else {
                 prayerStatus = "Microphone permission needed"
                 errorMessage = "Allow Microphone and Speech Recognition for Tevari in iPhone Settings, then start prayer again."
                 await sendPrayerEntryCard()
@@ -1166,6 +1271,18 @@ final class WearablesService: ObservableObject {
         } catch { errorMessage = "Could not show Faith Lens microphone status: \(error.localizedDescription)" }
     }
 
+    private func sendFaithLensQuestionCaptureCard() async {
+        guard let display else { return }
+        do {
+            try await display.send(
+                FlexBox(direction: .column, spacing: 12) {
+                    Text("Faith Lens", style: .heading)
+                    Text("Saving this moment, then opening your glasses microphone…", style: .body, color: .secondary)
+                }.padding(24).background(.card)
+            )
+        } catch { errorMessage = "Could not prepare Faith Lens question: \(error.localizedDescription)" }
+    }
+
     private func sendFaithLensListeningCard() async {
         guard let display else { return }
         let service = self
@@ -1182,8 +1299,7 @@ final class WearablesService: ObservableObject {
                     })
                     Button(label: "Cancel", style: .primary, onClick: {
                         Task { @MainActor [service] in
-                            service.stopFaithLensListening()
-                            await service.sendFaithLensCameraReadyCard()
+                            service.resumeFaithLensCameraAfterQuestionCancellation()
                         }
                     })
                 }.padding(24).background(.card)
@@ -1271,7 +1387,9 @@ final class WearablesService: ObservableObject {
             try await display.send(
                 FlexBox(direction: .column, spacing: 12) {
                     Text("Faith Lens", style: .heading)
-                    Text(result.response, style: .body)
+                    if !result.response.isEmpty {
+                        Text(result.response, style: .body)
+                    }
                     Text("Scripture", style: .heading)
                     Text(result.scripture.reference, style: .body, color: .secondary)
                     Text(result.scripture.content, style: .body)
@@ -1773,11 +1891,31 @@ final class WearablesService: ObservableObject {
     }
 
     private func requestMicrophoneAuthorization() async -> Bool {
-        await withCheckedContinuation { continuation in
-            AVAudioSession.sharedInstance().requestRecordPermission { granted in
+        let audioSession = AVAudioSession.sharedInstance()
+        switch audioSession.recordPermission {
+        case .granted:
+            return true
+        case .denied:
+            return false
+        case .undetermined:
+            break
+        @unknown default:
+            return false
+        }
+        return await withCheckedContinuation { continuation in
+            audioSession.requestRecordPermission { granted in
                 continuation.resume(returning: granted)
             }
         }
+    }
+
+    /// Do not use `await speech && await microphone` here. Swift short-circuits
+    /// that expression, which can suppress the iPhone microphone consent sheet
+    /// completely when Speech Recognition has not yet been authorized.
+    private func requestVoiceAuthorizations() async -> Bool {
+        let microphoneGranted = await requestMicrophoneAuthorization()
+        let speechGranted = await requestSpeechAuthorization()
+        return microphoneGranted && speechGranted
     }
 
     private func requestSpeechAuthorization() async -> Bool {

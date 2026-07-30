@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import FirebaseAuth
+import MediaPlayer
 import PhotosUI
 import SwiftUI
 import UIKit
@@ -97,15 +98,22 @@ struct TevariHomeShell: View {
 
     private var homeHeader: some View {
         HStack(alignment: .center) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("TEVARI")
-                    .font(.system(size: 13, weight: .bold))
-                    .tracking(4)
-                    .foregroundStyle(Color.tevariGold)
-                Text("A faithful way through the present.")
-                    .font(.system(size: 17, weight: .medium, design: .serif))
-                    .foregroundStyle(.white.opacity(0.86))
-                    .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Image("TevariMark")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 32, height: 32)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("TEVARI")
+                        .font(.system(size: 13, weight: .bold))
+                        .tracking(4)
+                        .foregroundStyle(Color.tevariGold)
+                    Text("A faithful way through the present.")
+                        .font(.system(size: 17, weight: .medium, design: .serif))
+                        .foregroundStyle(.white.opacity(0.86))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer()
             Button { showsSettings = true } label: {
@@ -270,6 +278,28 @@ private struct GlassesCompanionView: View {
                 .buttonStyle(PhonePrimaryButtonStyle())
 
                 if wearables.isExperienceActive {
+                    HStack(spacing: 13) {
+                        Image(systemName: "waveform.circle")
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundStyle(Color.tevariGold)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Connect glasses microphone")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(.white)
+                            Text("Tap the route icon and choose your glasses before starting a spoken experience.")
+                                .font(.footnote)
+                                .foregroundStyle(.white.opacity(0.58))
+                        }
+                        Spacer(minLength: 8)
+                        GlassesAudioRoutePicker()
+                            .frame(width: 44, height: 44)
+                            .accessibilityLabel("Choose glasses audio route")
+                    }
+                    .padding(15)
+                    .background(Color.tevariGold.opacity(0.10), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.tevariGold.opacity(0.25), lineWidth: 1))
+                    .onAppear { wearables.prepareGlassesAudioRoute() }
+
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Send to glasses")
                             .font(.system(size: 15, weight: .semibold))
@@ -313,6 +343,22 @@ private struct GlassesCompanionView: View {
         .padding(16)
         .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
+}
+
+/// Apple's route picker is the supported way for the wearer to choose a
+/// paired Bluetooth HFP device. Once selected, iOS routes its microphone and
+/// output together for the active `.playAndRecord` session.
+private struct GlassesAudioRoutePicker: UIViewRepresentable {
+    func makeUIView(context: Context) -> MPVolumeView {
+        let routePicker = MPVolumeView(frame: .zero)
+        routePicker.showsVolumeSlider = false
+        routePicker.showsRouteButton = true
+        routePicker.tintColor = UIColor(Color.tevariGold)
+        routePicker.backgroundColor = .clear
+        return routePicker
+    }
+
+    func updateUIView(_ uiView: MPVolumeView, context: Context) {}
 }
 
 // MARK: - Phone modules
@@ -702,8 +748,10 @@ private struct PrayerResultCard: View {
 private struct FaithLensResultCard: View {
     let result: TevariFaithLensResponse
     var body: some View {
-        ResultCard(title: "Reflection", eyebrow: result.scripture.reference) {
-            Text(result.response).font(.system(size: 17, design: .serif)).foregroundStyle(.white)
+        ResultCard(title: result.response.isEmpty ? "Scripture for this moment" : "Reflection", eyebrow: result.scripture.reference) {
+            if !result.response.isEmpty {
+                Text(result.response).font(.system(size: 17, design: .serif)).foregroundStyle(.white)
+            }
             if let prayer = result.prayer { Text("Prayer\n\(prayer)").font(.subheadline).foregroundStyle(.white.opacity(0.72)) }
             ScriptureCard(scripture: result.scripture)
         }
@@ -855,25 +903,188 @@ private struct TevariSettingsView: View {
     @ObservedObject var wearables: WearablesService
     @Environment(\.dismiss) private var dismiss
     @State private var confirmsLogout = false
+    @State private var confirmsDeletion = false
+    @State private var confirmsGoogleDeletion = false
+    @State private var showsPasswordDeletion = false
+    @State private var deletionError: String?
     var body: some View {
+        settingsNavigation
+            .preferredColorScheme(.dark)
+    }
+
+    private var settingsNavigation: some View {
         NavigationStack {
+            settingsList
+        }
+        .sheet(isPresented: $showsPasswordDeletion) {
+            AccountDeletionPasswordView(auth: auth) { result in handleAccountDeletion(result) }
+                .presentationDetents([.height(290)])
+        }
+        .alert("Log out of Tevari?", isPresented: $confirmsLogout) {
+            Button("Log out", role: .destructive) { try? auth.signOut(); dismiss() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("You can sign in or continue as a guest again at any time.")
+        }
+        .alert("Delete your Tevari account?", isPresented: $confirmsDeletion) {
+            Button("Delete account", role: .destructive) { Task { await beginAccountDeletion() } }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This permanently removes your Tevari sign-in, including a guest account. Tevari does not keep your prayers, photos, stories, or Parallel prompts in an account database. This cannot be undone.")
+        }
+        .alert("Confirm with Google", isPresented: $confirmsGoogleDeletion) {
+            Button("Continue with Google", role: .destructive) { Task { await finishGoogleAccountDeletion() } }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("For your protection, Google needs to confirm your identity before Tevari can permanently delete this account.")
+        }
+        .alert("Couldn’t delete account", isPresented: deletionErrorPresented) {
+            Button("OK", role: .cancel) { deletionError = nil }
+        } message: {
+            Text(deletionErrorMessage)
+        }
+    }
+
+    private var settingsList: some View {
             List {
                 Section("Your space") {
-                    HStack { Image(systemName: auth.user?.isAnonymous == true ? "person.crop.circle.badge.questionmark" : "person.crop.circle"); Text(auth.user?.isAnonymous == true ? "Guest session" : (auth.user?.displayName ?? auth.user?.email ?? "Signed in")) }
-                    if auth.user?.isAnonymous == true { Text("Guest access works with every Tevari experience. Create an account later to keep an identity across devices.").font(.footnote).foregroundStyle(.secondary) }
+                    HStack(spacing: 8) {
+                        Image(systemName: accountIconName)
+                        Text(accountTitle)
+                    }
+                    if isGuest {
+                        Text("Guest access works with every Tevari experience. Create an account later to keep an identity across devices.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Section("Faith background") {
-                    Picker("Perspective", selection: Binding(get: { wearables.tradition }, set: { wearables.selectTradition($0) })) { ForEach(WearablesService.Tradition.allCases, id: \.self) { Text($0.label).tag($0) } }
+                    FaithBackgroundPicker(wearables: wearables)
                 }
                 Section("Siri") {
                     Text("Say: “Siri, start a prayer with Tevari,” “Open Faith Lens in Tevari,” “Start a Bible story with Tevari,” or “Open Parallel in Tevari.”")
                         .font(.footnote)
                 }
-                Section { Button("Log out", role: .destructive) { confirmsLogout = true } } footer: { Text("Logging out ends this device’s current Tevari session.") }
+            Section {
+                Button("Log out", role: .destructive) { confirmsLogout = true }
+                Button("Delete account", role: .destructive) { confirmsDeletion = true }
+                    .disabled(auth.isWorking)
+            } header: {
+                Text("Account")
+            } footer: {
+                Text("Logging out ends this device’s current Tevari session. Deleting an account permanently removes its Tevari sign-in and cannot be undone.")
             }
-            .scrollContentBackground(.hidden).background(Color.tevariMidnight)
-            .navigationTitle("Settings").toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
-            .alert("Log out of Tevari?", isPresented: $confirmsLogout) { Button("Log out", role: .destructive) { try? auth.signOut(); dismiss() }; Button("Cancel", role: .cancel) { } } message: { Text("You can sign in or continue as a guest again at any time.") }
+            }
+            .scrollContentBackground(.hidden)
+            .background(Color.tevariMidnight)
+            .navigationTitle("Settings")
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
+    }
+
+    private var isGuest: Bool {
+        auth.user?.isAnonymous == true
+    }
+
+    private var accountIconName: String {
+        isGuest ? "person.crop.circle.badge.questionmark" : "person.crop.circle"
+    }
+
+    private var accountTitle: String {
+        if isGuest { return "Guest session" }
+        return auth.user?.displayName ?? auth.user?.email ?? "Signed in"
+    }
+
+    private var deletionErrorPresented: Binding<Bool> {
+        Binding(
+            get: { deletionError != nil },
+            set: { isPresented in if !isPresented { deletionError = nil } }
+        )
+    }
+
+    private var deletionErrorMessage: String {
+        deletionError ?? ""
+    }
+
+    private func beginAccountDeletion() async {
+        handleAccountDeletion(await auth.deleteCurrentAccount())
+    }
+
+    private func finishGoogleAccountDeletion() async {
+        handleAccountDeletion(await auth.reauthenticateWithGoogleAndDelete())
+    }
+
+    private func handleAccountDeletion(_ result: AccountDeletionResult) {
+        switch result {
+        case .deleted:
+            dismiss()
+        case .requiresPassword:
+            showsPasswordDeletion = true
+        case .requiresGoogleSignIn:
+            confirmsGoogleDeletion = true
+        case .failed(let message):
+            deletionError = message
+        }
+    }
+}
+
+private struct FaithBackgroundPicker: View {
+    @ObservedObject var wearables: WearablesService
+
+    var body: some View {
+        Picker("Perspective", selection: traditionSelection) {
+            Text("No preference").tag("general")
+            Text("Evangelical").tag("evangelical")
+            Text("Catholic").tag("catholic")
+            Text("Protestant").tag("mainline")
+        }
+    }
+
+    private var traditionSelection: Binding<String> {
+        Binding(
+            get: { wearables.tradition.rawValue },
+            set: { rawValue in
+                guard let selection = WearablesService.Tradition(rawValue: rawValue) else { return }
+                wearables.selectTradition(selection)
+            }
+        )
+    }
+}
+
+private struct AccountDeletionPasswordView: View {
+    @ObservedObject var auth: AuthenticationService
+    let completion: (AccountDeletionResult) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var password = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Confirm your password")
+                    .font(.title3.weight(.semibold))
+                Text("For your protection, enter your password to permanently delete this Tevari account.")
+                    .foregroundStyle(.secondary)
+                SecureField("Password", text: $password)
+                    .textContentType(.password)
+                    .padding(12)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                Button(role: .destructive) {
+                    Task {
+                        let result = await auth.deleteCurrentAccount(password: password)
+                        if case .deleted = result { dismiss() }
+                        completion(result)
+                    }
+                } label: {
+                    HStack { Spacer(); Text(auth.isWorking ? "Deleting…" : "Delete account"); Spacer() }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .disabled(password.isEmpty || auth.isWorking)
+                Spacer()
+            }
+            .padding(24)
+            .navigationTitle("Delete account")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
         }
         .preferredColorScheme(.dark)
     }
